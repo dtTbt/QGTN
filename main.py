@@ -20,13 +20,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 
-import datasets
 import util.misc as utils
-from datasets import get_coco_api_from_dataset
-from engine import evaluate, train_one_epoch
+from engine import train_one_epoch
 from models import build_model
 
-from datasets.coco import make_coco_transforms
 from datasets.build import build_dataset, collate_fn
 from utils.transforms import build_transforms
 from torch.cuda import amp
@@ -36,9 +33,9 @@ import eval_cuhk
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
-    parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--lr_backbone', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=18, type=int)
+    parser.add_argument('--lr', default=2e-6, type=float)
+    parser.add_argument('--lr_backbone', default=2e-6, type=float)
+    parser.add_argument('--batch_size', default=17, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--lr_drop', default=15, type=int)
@@ -98,12 +95,9 @@ def get_args_parser():
     parser.add_argument('--focal_alpha', default=0.25, type=float)
 
     # dataset parameters
-    parser.add_argument('--dataset_file', default='coco')
-    parser.add_argument('--coco_path', default='/root/autodl-tmp/coco', type=str)
-    parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
 
-    parser.add_argument('--output_dir', default='/cDETR/outputs',
+    parser.add_argument('--output_dir', default='/QGTN/outputs',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -116,12 +110,11 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=2, type=int)
 
     # distributed training parameters
-    parser.add_argument('--world_size', default=1, type=int,
-                        help='number of distributed processes')
-    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
+    parser.add_argument('--dist_url', default='172.17.0.5:55568', help='url used to set up distributed training')
 
-    parser.add_argument('--pretrain', default='/cDETR/train_pth_0/model_epoch15_9.0.pth', type=str)
-    parser.add_argument('--eval_pth', default='/cDETR/train_pth_0/model_epoch15_9.0.pth', type=str)
+    parser.add_argument('--pretrain', default='/cDETR/train_pth/model_epoch6_8.0.pth', type=str)
+    parser.add_argument('--eval_pth', default='/QGTN/train_pth_0/model_epoch6_59.49367088607595.pth', type=str)
     parser.add_argument('--model_save_dir', default='./train_pth', type=str)
 
     return parser
@@ -191,7 +184,7 @@ def main(args):
 
     if args.eval:
         resume_pth(args.eval_pth, model)
-        eval_cuhk.eval(model, data_loader_val,device,enable_amp, scaler, use_cache=True)
+        _ = eval_cuhk.eval(model, data_loader_val,device,enable_amp, scaler, use_cache=False)
         exit(0)
 
     if args.pretrain:
@@ -209,8 +202,8 @@ def main(args):
             args.clip_max_norm,enable_amp, scaler)
         lr_scheduler.step()
         if epoch % 3 == 0:
-            top1_acc = eval_cuhk.eval(model, data_loader_val, device, enable_amp, scaler, use_cache=False)
-            save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}_{top1_acc}.pth')
+            acc = eval_cuhk.eval(model, data_loader_val, device, enable_amp, scaler, use_cache=False)
+            save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}_{acc}.pth')
             torch.save(model.state_dict(), save_path)
             print(f'Model saved at epoch {epoch}.')
 

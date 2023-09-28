@@ -13,7 +13,49 @@ from util.misc import NestedTensor
 from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
 from torchvision.ops import box_iou
+import os
+import numpy as np
+from PIL import Image, ImageDraw
+import shutil
 
+
+def draw_boxes(image_path, boxes, output_folder, xyxy, sfx, keep_name):
+
+    # Load the image
+    image = Image.open(image_path).convert("RGB")
+
+    # Create a drawing object
+    draw = ImageDraw.Draw(image)
+
+    # Get image width and height
+    img_width, img_height = image.size
+
+    if boxes.dim() == 1:
+        boxes = boxes.unsqueeze(0)
+    if xyxy:
+        boxes = box_decoder(boxes, boxes.device)
+    # Convert boxes tensor to numpy array
+    boxes_np = boxes.detach().cpu().numpy()
+
+    for box in boxes_np:
+        center_x, center_y, width, height = box
+
+        # Convert center_x, center_y, width, and height to pixel coordinates
+        x1 = int((center_x - (width / 2)) * img_width)
+        y1 = int((center_y - (height / 2)) * img_height)
+        x2 = int((center_x + (width / 2)) * img_width)
+        y2 = int((center_y + (height / 2)) * img_height)
+
+        # Draw the bounding box
+        draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
+
+    # Save the image with bounding boxes
+    if keep_name:
+        output_filename = os.path.basename(image_path)[:-4] + '_' + sfx + os.path.basename(image_path)[-4:]
+    else:
+        output_filename = sfx + os.path.basename(image_path)[-4:]
+    output_path = os.path.join(output_folder, output_filename)
+    image.save(output_path)
 
 def trs_to_nestensor(samples):
     tensors = []
@@ -84,6 +126,19 @@ def post_process(outputs, targets,device):
 
     return boxes_out, boxes_target, scores_out
 
+def find_query(is_one,targets,boxes):
+    true_index = torch.where(is_one == True)
+    targets = targets[true_index]
+    boxes = boxes[true_index]
+    ious = box_iou(boxes,targets)
+    right_num = 0
+    all_num = boxes.shape[0]
+    for i in range(all_num):
+        iou = ious[i][i]
+        if iou >= 0.5:
+            right_num += 1
+    print(all_num, right_num)
+    return all_num, right_num
 
 def eval(model, data_loader,device,enable_amp, scaler, use_cache=False):
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -91,8 +146,9 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False):
     header = ''
     print_freq = 100
     model.eval()
+    cache_path = './eval_cache.pth'
     if use_cache:
-        loaded_data = torch.load('eval_cache.pth')
+        loaded_data = torch.load(cache_path)
         all_id = loaded_data['all_id'].to(device)
         all_is = loaded_data['all_is'].to(device)
         all_box = loaded_data['all_box'].to(device)
@@ -104,6 +160,10 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False):
         all_box = []
         all_score = []
         all_target = []
+        output_folder = './look'
+        if os.path.exists(output_folder):
+            shutil.rmtree(output_folder)
+        os.makedirs(output_folder)
         for query, gallery in metric_logger.log_every(data_loader, print_freq, header):
             query_nes = trs_to_nestensor(query)
             gallery_nes = trs_to_nestensor(gallery)
@@ -123,7 +183,12 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False):
             outputs, targets, scores = post_process(outputs, gallery, device)  # (bs,4) (bs,)  这里的targets仍为xyxy
             for index, ps in enumerate(query):
                 all_id.append(ps['id'])
-                all_is.append(not gallery[index]['id'] == -1)
+                exist_ = (not gallery[index]['id'] == -1)
+                all_is.append(exist_)
+                # if exist_:
+                #     draw_boxes(query[index]['img_path'], query[index]['box_nml'], output_folder, xyxy=True, sfx=str(ps['id']) + '-' + str(index) + '-query', keep_name = False)
+                #     draw_boxes(gallery[index]['img_path'], gallery[index]['box_nml'], output_folder, xyxy=True, sfx=str(ps['id']) + '-' + str(index) + '-target', keep_name = False)
+                #     draw_boxes(gallery[index]['img_path'], outputs[index], output_folder, xyxy=False, sfx=str(ps['id']) + '-' + str(index) + '-box', keep_name = False)
             all_box.append(outputs.detach())
             all_score.append(scores.detach())
             all_target.append(targets.detach())
@@ -132,36 +197,36 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False):
         all_box = torch.cat(all_box,dim=0).to(device)  # (n,4)
         all_score = torch.cat(all_score, dim=0).to(device)  # (n,)
         all_target = torch.cat(all_target, dim=0).to(device)  # (n,4)
-        cache_pth = './eval_cache.pth'
-        if os.path.exists(cache_pth):
-            os.remove(cache_pth)
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
         torch.save({
             'all_id': all_id,
             'all_is': all_is,
             'all_box': all_box,
             'all_score': all_score,
             'all_target': all_target
-        }, cache_pth)
+        }, cache_path)
     num_query = torch.max(all_id).item() + 1
     num_ss = 0.
+    all_num = 0.
+    right_num = 0.
     for now_id in range(num_query):
         index = torch.where(all_id == now_id)
-        boxes = all_box[index]
+        boxes = box_encoder(all_box[index], device)
         scores = all_score[index]
         targets = all_target[index]
         is_one = all_is[index]
         top1_index = torch.argmax(scores)
-        # while not is_one[top1_index] == True:
-        #     scores[top1_index] = 0
-        #     top1_index = torch.argmax(scores)
+        a, b = find_query(is_one,targets,boxes)
+        all_num += a
+        right_num += b
         if is_one[top1_index] == True:
             top1_box = boxes[top1_index]
             top1_box = top1_box.unsqueeze(dim=0)
-            top1_box = box_encoder(top1_box,device)
             iou = box_iou(top1_box,targets[top1_index].unsqueeze(dim=0)).item()
-            #print(iou)
             if iou >= 0.5:
                 num_ss += 1
     top1_acc = num_ss / num_query
-    print('top1_acc: ', top1_acc * 100, '%')
-    return top1_acc * 100
+    find_query_acc = right_num / all_num
+    print(f'find_query_acc: {find_query_acc * 100}%  top1_acc: {top1_acc * 100}%')
+    return find_query_acc * 100

@@ -28,8 +28,10 @@ from .transformer import build_transformer
 from collections import OrderedDict
 from torchvision.ops import MultiScaleRoIAlign
 
+
 class ConditionalDETR(nn.Module):
     """ This is the Conditional DETR module that performs object detection """
+
     def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
         """ Initializes the model.
         Parameters:
@@ -46,7 +48,7 @@ class ConditionalDETR(nn.Module):
         hidden_dim = transformer.d_model
         self.class_embed = nn.Sequential(nn.Linear(hidden_dim, 32),
                                          nn.ReLU(),
-                                         nn.Linear(32,num_classes)
+                                         nn.Linear(32, num_classes)
                                          )
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
@@ -59,7 +61,7 @@ class ConditionalDETR(nn.Module):
         # init prior_prob setting for focal loss
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
-        #self.class_embed.bias.data = torch.ones(num_classes) * bias_value
+        # self.class_embed.bias.data = torch.ones(num_classes) * bias_value
 
         # init bbox_mebed
         nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
@@ -87,14 +89,14 @@ class ConditionalDETR(nn.Module):
         features, pos = self.backbone(targets)  # gallery
         query, pos_query = self.backbone(samples)  # query
         query_feat, _ = query[-1].decompose()
-        query_feat = self.input_proj(query_feat)# + pos_query[-1]
+        query_feat = self.input_proj(query_feat)  # + pos_query[-1]
         dec_in = self.roi_pool(OrderedDict([["feat", query_feat]]), query_boxes_list, image_sizes)
-        dec_in = (dec_in.reshape(dec_in.shape[0], dec_in.shape[1], -1)).permute(2,0,1)
+        dec_in = (dec_in.reshape(dec_in.shape[0], dec_in.shape[1], -1)).permute(2, 0, 1)
         pos = pos[-1]  # 位置编码，形状同特征图
 
         src, mask = features[-1].decompose()  # src即特征图(bs,c,h,w)。mask(bs,h,w)
         src = self.input_proj(src)  # 通道数由2048缩减为256
-        #dec_in = self.query_embed.weight  # (max_len,d_model)，d_model为256
+        # dec_in = self.query_embed.weight  # (max_len,d_model)，d_model为256
         assert mask is not None
         hs, reference = self.transformer(src, mask, dec_in, pos)
         # hs(n_decoder_layers,bs,max_len,d_model)  reference(bs,max_len,2)
@@ -106,10 +108,10 @@ class ConditionalDETR(nn.Module):
             outputs_coord = tmp.sigmoid()  # 框值缩放到0~1区间
             outputs_coords.append(outputs_coord)
         outputs_coord = torch.stack(outputs_coords)  # (n_decoder_layers,bs,max_len,4)
-        #outputs_coord = outputs_coord.to(torch.float32)
+        # outputs_coord = outputs_coord.to(torch.float32)
 
         outputs_class = self.class_embed(hs)  # (n_decoder_layers,bs,max_len,1)
-        #outputs_class = outputs_class.to(torch.float32)
+        # outputs_class = outputs_class.to(torch.float32)
         out = {
             'pred_logits': outputs_class[-1],  # (bs,)
             'pred_boxes': outputs_coord[-1]  # (bs,4)
@@ -134,6 +136,7 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
+
     def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses):
         """ Create the criterion.
         Parameters:
@@ -149,7 +152,6 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.losses = losses
         self.focal_alpha = focal_alpha
-        
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss)
@@ -164,12 +166,13 @@ class SetCriterion(nn.Module):
                                     dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
 
-        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2]+1],
+        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
                                             dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
 
-        target_classes_onehot = target_classes_onehot[:,:,:-1]
-        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
+        target_classes_onehot = target_classes_onehot[:, :, :-1]
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * \
+                  src_logits.shape[1]
         losses = {'loss_ce': loss_ce}
 
         if log:
@@ -308,6 +311,7 @@ class SetCriterion(nn.Module):
 
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
+
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
         """ Perform the computation
@@ -328,8 +332,8 @@ class PostProcess(nn.Module):
         topk_boxes = topk_indexes // out_logits.shape[2]
         labels = topk_indexes % out_logits.shape[2]
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
-        boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1,1,4))
-        
+        boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
+
         # and from relative [0, 1] to absolute [0, height] coordinates
         img_h, img_w = target_sizes.unbind(1)
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)

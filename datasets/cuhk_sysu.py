@@ -90,14 +90,14 @@ class CUHKSYSU(BaseDataset):
                     index_l, index_r, is_one = test_data_index
                     test_data.append([test_gallery[index_l],test_gallery[index_r],is_one])
             return test_data
-        elif self.split == "val300":
+        elif self.split == "val100":
             test_data = []
             protoc = loadmat(osp.join(self.root, "annotation/test/train_test/TestG50.mat"))
             protoc = protoc["TestG50"].squeeze()
             for index, item in enumerate(protoc):  # 枚举每一个query人
                 # query
-                if index >= 100:
-                    break
+                # if index >= 100:
+                #     break
                 im_name = str(item["Query"][0, 0][0][0])
                 box = item["Query"][0, 0][1].squeeze().astype(np.int32)
                 box[2:] += box[:2]
@@ -118,6 +118,7 @@ class CUHKSYSU(BaseDataset):
                     if len(box) == 0:
                         box = np.array([1,1,1,1])
                         idd = -1
+                        break
                     test_gallery.append({
                         'id': idd,
                         'img_name': im_name,
@@ -129,3 +130,28 @@ class CUHKSYSU(BaseDataset):
                     index_l, index_r, is_one = test_data_index
                     test_data.append([test_gallery[index_l],test_gallery[index_r],is_one])
             return test_data
+        elif self.split == 'tv100':
+            train_data = []
+            train = loadmat(osp.join(self.root, "annotation/test/train_test/Train.mat"))
+            train = train["Train"].squeeze()
+            for index, item in enumerate(train):  # 枚举每个人，从0开始编号
+                if index >= 100:
+                    break
+                scenes = item[0, 0][2].squeeze()
+                train_gallery = []
+                for img_name, box, _ in scenes:  # 枚举这个人的每一次出现（出现在的图片与图片中的位置）
+                    img_name = str(img_name[0])
+                    box = box.squeeze().astype(np.int32)
+                    box[2:] += box[:2]
+                    assert (box[2:] >= box[:2]).all()
+                    train_gallery.append({
+                        'id': index,
+                        'img_name': img_name,
+                        'box': box,
+                        'img_path': os.path.join(self.img_prefix, img_name),
+                    })
+                train_data_indexes=self.get_train_data_index(len(train_gallery))
+                for train_data_index in train_data_indexes:
+                    index_l, index_r, is_one = train_data_index
+                    train_data.append([train_gallery[index_l],train_gallery[index_r],is_one])
+            return train_data

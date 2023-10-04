@@ -137,10 +137,10 @@ def find_query(is_one,targets,boxes):
         iou = ious[i][i]
         if iou >= 0.5:
             right_num += 1
-    print(all_num, right_num)
+    #print(all_num, right_num)
     return all_num, right_num
 
-def eval(model, data_loader,device,enable_amp, scaler, use_cache=False):
+def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=False):
     metric_logger = utils.MetricLogger(delimiter="  ")
     #metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = ''
@@ -185,10 +185,10 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False):
                 all_id.append(ps['id'])
                 exist_ = (not gallery[index]['id'] == -1)
                 all_is.append(exist_)
-                # if exist_:
-                #     draw_boxes(query[index]['img_path'], query[index]['box_nml'], output_folder, xyxy=True, sfx=str(ps['id']) + '-' + str(index) + '-query', keep_name = False)
-                #     draw_boxes(gallery[index]['img_path'], gallery[index]['box_nml'], output_folder, xyxy=True, sfx=str(ps['id']) + '-' + str(index) + '-target', keep_name = False)
-                #     draw_boxes(gallery[index]['img_path'], outputs[index], output_folder, xyxy=False, sfx=str(ps['id']) + '-' + str(index) + '-box', keep_name = False)
+                if save and exist_:
+                    draw_boxes(query[index]['img_path'], query[index]['box_nml'], output_folder, xyxy=True, sfx=str(ps['id']) + '-' + str(index) + '-query', keep_name = False)
+                    draw_boxes(gallery[index]['img_path'], gallery[index]['box_nml'], output_folder, xyxy=True, sfx=str(ps['id']) + '-' + str(index) + '-target', keep_name = False)
+                    draw_boxes(gallery[index]['img_path'], outputs[index], output_folder, xyxy=False, sfx=str(ps['id']) + '-' + str(index) + '-box', keep_name = False)
             all_box.append(outputs.detach())
             all_score.append(scores.detach())
             all_target.append(targets.detach())
@@ -228,5 +228,6 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False):
                 num_ss += 1
     top1_acc = num_ss / num_query
     find_query_acc = right_num / all_num
-    print(f'find_query_acc: {find_query_acc * 100}%  top1_acc: {top1_acc * 100}%')
+    #print(f'find_query_acc: {find_query_acc * 100}%  top1_acc: {top1_acc * 100}%')
+    print(f'find_query_acc: {find_query_acc * 100}%')
     return find_query_acc * 100

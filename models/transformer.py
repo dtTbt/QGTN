@@ -47,7 +47,7 @@ def gen_sineembed_for_position(pos_tensor):
 
 class Transformer(nn.Module):
 
-    def __init__(self, d_model=512, nhead=8, num_queries=300, num_encoder_layers=6,
+    def __init__(self, d_model=512, nhead=8, num_queries=16, num_encoder_layers=6,
                  num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False,
                  return_intermediate_dec=False):
@@ -76,16 +76,17 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed):
+    def forward(self, src, mask, query_embed, pos_embed, query_person):
         # flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
-        src = src.flatten(2).permute(2, 0, 1)
-        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
-        #query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
-        mask = mask.flatten(1)
+        src = src.flatten(2).permute(2, 0, 1)  # (h*w,bs,d_model), 图片信息
+        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)  # (h*w,bs,d_model), 位置编码
+        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)  # (n_q,bs,d_model)
+        mask = mask.flatten(1)  # (bs,h*w)
 
-        tgt = torch.zeros_like(query_embed)
-        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        #tgt = torch.zeros_like(query_embed)  # (n_query,bs,d_model)
+        tgt = query_person
+        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)  # (h*w,bs,d_model)
         hs, references = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed)
         return hs, references
@@ -138,22 +139,22 @@ class TransformerDecoder(nn.Module):
         output = tgt
 
         intermediate = []
-        reference_points_before_sigmoid = self.ref_point_head(query_pos)    # [num_queries, batch_size, 2]
-        reference_points = reference_points_before_sigmoid.sigmoid().transpose(0, 1)
+        reference_points_before_sigmoid = self.ref_point_head(query_pos)    # FFN将 (n_q,bs,256) -> (n_q,bs,2)
+        reference_points = reference_points_before_sigmoid.sigmoid().transpose(0, 1)  # (bs,n_q,2)
 
         for layer_id, layer in enumerate(self.layers):
-            obj_center = reference_points[..., :2].transpose(0, 1)      # [num_queries, batch_size, 2]
+            obj_center = reference_points[..., :2].transpose(0, 1)      # 参考点，(n_q,bs,2)
 
             # For the first decoder layer, we do not apply transformation over p_s
             if layer_id == 0:
                 pos_transformation = 1
             else:
-                pos_transformation = self.query_scale(output)
+                pos_transformation = self.query_scale(output)  # 根据上一层decoder_layer得输出得到参考点编码变换
 
             # get sine embedding for the query vector
-            query_sine_embed = gen_sineembed_for_position(obj_center)     
+            query_sine_embed = gen_sineembed_for_position(obj_center)  # 参考点编码。(n_q,bs,2) -> (n_q,bs,d_model)
             # apply transformation
-            query_sine_embed = query_sine_embed * pos_transformation
+            query_sine_embed = query_sine_embed * pos_transformation  # 逐元素乘法
             output = layer(output, memory, tgt_mask=tgt_mask,
                            memory_mask=memory_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
@@ -290,11 +291,11 @@ class TransformerDecoderLayer(nn.Module):
         # ========== Begin of Self-Attention =============
         # Apply projections here
         # shape: num_queries x batch_size x 256
-        q_content = self.sa_qcontent_proj(tgt)      # target is the input of the first decoder layer. zero by default.
-        q_pos = self.sa_qpos_proj(query_pos)
-        k_content = self.sa_kcontent_proj(tgt)
-        k_pos = self.sa_kpos_proj(query_pos)
-        v = self.sa_v_proj(tgt)
+        q_content = self.sa_qcontent_proj(tgt)  # 维度不变 (n_q,bs,d_model)
+        q_pos = self.sa_qpos_proj(query_pos)  # 维度不变 (n_q,bs,d_model)
+        k_content = self.sa_kcontent_proj(tgt)  # 维度不变 (n_q,bs,d_model)
+        k_pos = self.sa_kpos_proj(query_pos)  # 维度不变 (n_q,bs,d_model)
+        v = self.sa_v_proj(tgt)  # 维度不变 (n_q,bs,d_model)
 
         num_queries, bs, n_model = q_content.shape
         hw, _, _ = k_content.shape

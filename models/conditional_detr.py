@@ -43,7 +43,9 @@ class ConditionalDETR(nn.Module):
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
         """
         super().__init__()
-        self.num_queries = num_queries
+        self.query_feat_len = 4
+        self.max_len_dec = self.query_feat_len * self.query_feat_len
+        self.num_queries = self.max_len_dec
         self.transformer = transformer
         hidden_dim = transformer.d_model
         self.class_embed = nn.Sequential(nn.Linear(hidden_dim, 32),
@@ -55,8 +57,6 @@ class ConditionalDETR(nn.Module):
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
-        self.query_feat_len = 4
-        self.max_len_dec = self.query_feat_len * self.query_feat_len
 
         # init prior_prob setting for focal loss
         prior_prob = 0.01
@@ -90,15 +90,15 @@ class ConditionalDETR(nn.Module):
         query, pos_query = self.backbone(samples)  # query
         query_feat, _ = query[-1].decompose()
         query_feat = self.input_proj(query_feat)  # + pos_query[-1]
-        dec_in = self.roi_pool(OrderedDict([["feat", query_feat]]), query_boxes_list, image_sizes)
-        dec_in = (dec_in.reshape(dec_in.shape[0], dec_in.shape[1], -1)).permute(2, 0, 1)
+        tgt = self.roi_pool(OrderedDict([["feat", query_feat]]), query_boxes_list, image_sizes)
+        tgt = (tgt.reshape(tgt.shape[0], tgt.shape[1], -1)).permute(2, 0, 1)
         pos = pos[-1]  # 位置编码，形状同特征图
 
         src, mask = features[-1].decompose()  # src即特征图(bs,c,h,w)。mask(bs,h,w)
         src = self.input_proj(src)  # 通道数由2048缩减为256
-        # dec_in = self.query_embed.weight  # (max_len,d_model)，d_model为256
+        dec_in = self.query_embed.weight  # (max_len,d_model)，d_model为256
         assert mask is not None
-        hs, reference = self.transformer(src, mask, dec_in, pos)
+        hs, reference = self.transformer(src, mask, dec_in, pos, tgt)
         # hs(n_decoder_layers,bs,max_len,d_model)  reference(bs,max_len,2)
         reference_before_sigmoid = inverse_sigmoid(reference)  # 将sigmoid后的值变回去
         outputs_coords = []

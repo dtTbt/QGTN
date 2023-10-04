@@ -17,7 +17,7 @@ def _make_conditional_detr(backbone_name: str, dilation=False, num_classes=91, m
     backbone_with_pos_enc = Joiner(backbone, pos_enc)
     backbone_with_pos_enc.num_channels = backbone.num_channels
     transformer = Transformer(d_model=hidden_dim, return_intermediate_dec=True)
-    detr = ConditionalDETR(backbone_with_pos_enc, transformer, num_classes=num_classes, num_queries=300)
+    detr = ConditionalDETR(backbone_with_pos_enc, transformer, num_classes=num_classes, num_queries=16)
     if mask:
         return DETRsegm(detr)
     return detr

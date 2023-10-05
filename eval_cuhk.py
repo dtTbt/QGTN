@@ -94,37 +94,12 @@ def get_box_loss(a,b):
     return re
 
 def post_process(outputs, targets,device):
-    scores = outputs['pred_logits']
-    boxes = outputs['pred_boxes']
-    scores = scores.sigmoid()
-    boxes_out = []
-    scores_out = []
-    for bs_index in range(scores.shape[0]):
-        scores_tmp = scores[bs_index]
-        boxes_tmp = boxes[bs_index]
-        max_score = 0
-        max_index = -1
-        for n_index in range(scores.shape[1]):
-            if scores_tmp[n_index][0] > scores_tmp[n_index][1]:
-                continue
-            if scores_tmp[n_index][1] > max_score:
-                max_score = scores_tmp[n_index][1]
-                max_index = n_index
-        if max_index == -1:
-            boxes_out.append(torch.tensor([-1,-1,-1,-1]).to(device))
-            scores_out.append(torch.tensor(0).to(device))
-        else:
-            boxes_out.append(boxes_tmp[max_index])
-            scores_out.append(scores_tmp[max_index][1])
-    boxes_out = torch.stack(boxes_out,dim=0)  # box , (xc,yc,w,h) , (bs,4)
-    scores_out = torch.stack(scores_out, dim=0)
-
     boxes_target = []
     for target in targets:
         boxes_target.append(target['box_nml'])
     boxes_target = torch.stack(boxes_target)  # target , (x,y,x,y) , (bs,4)
 
-    return boxes_out, boxes_target, scores_out
+    return outputs['boxes'][-1], boxes_target, 1
 
 def find_query(is_one,targets,boxes):
     true_index = torch.where(is_one == True)
@@ -152,13 +127,11 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
         all_id = loaded_data['all_id'].to(device)
         all_is = loaded_data['all_is'].to(device)
         all_box = loaded_data['all_box'].to(device)
-        all_score = loaded_data['all_score'].to(device)
         all_target = loaded_data['all_target'].to(device)
     else:
         all_id = []
         all_is = []
         all_box = []
-        all_score = []
         all_target = []
         output_folder = './look'
         if os.path.exists(output_folder):
@@ -190,12 +163,10 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
                     draw_boxes(gallery[index]['img_path'], gallery[index]['box_nml'], output_folder, xyxy=True, sfx=str(ps['id']) + '-' + str(index) + '-target', keep_name = False)
                     draw_boxes(gallery[index]['img_path'], outputs[index], output_folder, xyxy=False, sfx=str(ps['id']) + '-' + str(index) + '-box', keep_name = False)
             all_box.append(outputs.detach())
-            all_score.append(scores.detach())
             all_target.append(targets.detach())
         all_id = torch.tensor(all_id).to(device)  # (n,)  n为eval数据集总查询对数
         all_is = torch.tensor(all_is).to(device)  # (n,)
         all_box = torch.cat(all_box,dim=0).to(device)  # (n,4)
-        all_score = torch.cat(all_score, dim=0).to(device)  # (n,)
         all_target = torch.cat(all_target, dim=0).to(device)  # (n,4)
         if os.path.exists(cache_path):
             os.remove(cache_path)
@@ -203,31 +174,19 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
             'all_id': all_id,
             'all_is': all_is,
             'all_box': all_box,
-            'all_score': all_score,
             'all_target': all_target
         }, cache_path)
     num_query = torch.max(all_id).item() + 1
-    num_ss = 0.
     all_num = 0.
     right_num = 0.
     for now_id in range(num_query):
         index = torch.where(all_id == now_id)
         boxes = box_encoder(all_box[index], device)
-        scores = all_score[index]
         targets = all_target[index]
         is_one = all_is[index]
-        top1_index = torch.argmax(scores)
         a, b = find_query(is_one,targets,boxes)
         all_num += a
         right_num += b
-        if is_one[top1_index] == True:
-            top1_box = boxes[top1_index]
-            top1_box = top1_box.unsqueeze(dim=0)
-            iou = box_iou(top1_box,targets[top1_index].unsqueeze(dim=0)).item()
-            if iou >= 0.5:
-                num_ss += 1
-    top1_acc = num_ss / num_query
     find_query_acc = right_num / all_num
-    #print(f'find_query_acc: {find_query_acc * 100}%  top1_acc: {top1_acc * 100}%')
     print(f'find_query_acc: {find_query_acc * 100}%')
     return find_query_acc * 100

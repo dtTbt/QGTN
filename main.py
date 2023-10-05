@@ -33,12 +33,12 @@ import eval_cuhk
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
-    parser.add_argument('--lr', default=1e-5, type=float)
+    parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
     parser.add_argument('--batch_size', default=17, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=30, type=int)
-    parser.add_argument('--lr_drop', default=15, type=int)
+    parser.add_argument('--lr_drop', default=20, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
 
@@ -54,7 +54,7 @@ def get_args_parser():
                         help="Type of positional embedding to use on top of the image features")
 
     # * Transformer
-    parser.add_argument('--enc_layers', default=6, type=int,
+    parser.add_argument('--enc_layers', default=3, type=int,
                         help="Number of encoding layers in the transformer")
     parser.add_argument('--dec_layers', default=6, type=int,
                         help="Number of decoding layers in the transformer")
@@ -113,8 +113,8 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='172.17.0.5:55568', help='url used to set up distributed training')
 
-    parser.add_argument('--pretrain', default='/QGTN/train_pth_0/model_epoch6_42.059849458417474.pth', type=str)
-    parser.add_argument('--eval_pth', default='/QGTN/train_pth/model_epoch2_42.64732880484671.pth', type=str)
+    parser.add_argument('--pretrain', default='', type=str)
+    parser.add_argument('--eval_pth', default='', type=str)
     parser.add_argument('--model_save_dir', default='./train_pth', type=str)
 
     return parser
@@ -186,8 +186,9 @@ def main(args):
     scaler = amp.GradScaler(enabled=enable_amp)
 
     if args.eval:
-        resume_pth(args.eval_pth, model)
-        _ = eval_cuhk.eval(model, data_loader_tv,device,enable_amp, scaler, use_cache=False, save=True)
+        if args.eval_pth:
+            resume_pth(args.eval_pth, model)
+        acc_t = eval_cuhk.eval(model, data_loader_tv,device,enable_amp, scaler, use_cache=False, save=True)
         exit(0)
 
     if args.pretrain:
@@ -202,11 +203,15 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm,enable_amp, scaler)
+            args.clip_max_norm,enable_amp, scaler, auto_amp=True)
         lr_scheduler.step()
+        acc_t = eval_cuhk.eval(model, data_loader_tv, device, enable_amp, scaler, use_cache=False, save=True)
+        acc_t = round(acc_t, 2)
+        print(f'acc_tv: {acc_t}%')
         if epoch % 2 == 0:
-            acc = eval_cuhk.eval(model, data_loader_val, device, enable_amp, scaler, use_cache=False)
-            save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}_{acc}.pth')
+            acc = eval_cuhk.eval(model, data_loader_val, device, enable_amp, scaler, use_cache=False, save=False)
+            acc = round(acc,2)
+            save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}_{acc}_{acc_t}.pth')
             torch.save(model.state_dict(), save_path)
             print(f'Model saved at epoch {epoch}.')
 

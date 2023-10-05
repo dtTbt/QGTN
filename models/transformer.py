@@ -76,19 +76,19 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed, query_person):
+    def forward(self, src, mask, query_embed, pos_embed, query_person, person_pos):
         # flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
         src = src.flatten(2).permute(2, 0, 1)  # (h*w,bs,d_model), 图片信息
         pos_embed = pos_embed.flatten(2).permute(2, 0, 1)  # (h*w,bs,d_model), 位置编码
+        person_pos = person_pos.flatten(2).permute(2, 0, 1)
         query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)  # (n_q,bs,d_model)
         mask = mask.flatten(1)  # (bs,h*w)
 
-        #tgt = torch.zeros_like(query_embed)  # (n_query,bs,d_model)
-        tgt = query_person
+        tgt = torch.zeros_like(query_embed)  # (n_query,bs,d_model)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)  # (h*w,bs,d_model)
         hs, references = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                          pos=pos_embed, query_pos=query_embed)
+                          pos=pos_embed, query_pos=query_embed, query_person=query_person, person_pos=person_pos)
         return hs, references
 
 
@@ -135,7 +135,9 @@ class TransformerDecoder(nn.Module):
                 tgt_key_padding_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+                query_pos: Optional[Tensor] = None,
+                query_person=None,
+                person_pos=None):
         output = tgt
 
         intermediate = []
@@ -160,7 +162,7 @@ class TransformerDecoder(nn.Module):
                            tgt_key_padding_mask=tgt_key_padding_mask,
                            memory_key_padding_mask=memory_key_padding_mask,
                            pos=pos, query_pos=query_pos, query_sine_embed=query_sine_embed,
-                           is_first=(layer_id == 0))
+                           is_first=(layer_id == 0), query_person=query_person, person_pos=person_pos)
             if self.return_intermediate:
                 intermediate.append(self.norm(output))
 
@@ -286,13 +288,20 @@ class TransformerDecoderLayer(nn.Module):
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None,
                      query_sine_embed = None,
-                     is_first = False):
+                     is_first = False,
+                     query_person=None,
+                     person_pos=None,
+                     ):
                      
         # ========== Begin of Self-Attention =============
         # Apply projections here
         # shape: num_queries x batch_size x 256
+        query_person = query_person + person_pos
+
+        tgt = tgt + query_person
+
         q_content = self.sa_qcontent_proj(tgt)  # 维度不变 (n_q,bs,d_model)
-        q_pos = self.sa_qpos_proj(query_pos)  # 维度不变 (n_q,bs,d_model)
+        q_pos = self.sa_qpos_proj(query_pos)  # query_pos是随机。维度不变 (n_q,bs,d_model)
         k_content = self.sa_kcontent_proj(tgt)  # 维度不变 (n_q,bs,d_model)
         k_pos = self.sa_kpos_proj(query_pos)  # 维度不变 (n_q,bs,d_model)
         v = self.sa_v_proj(tgt)  # 维度不变 (n_q,bs,d_model)
@@ -384,13 +393,16 @@ class TransformerDecoderLayer(nn.Module):
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None,
                 query_sine_embed = None,
-                is_first = False):
+                is_first = False,
+                query_person = None,
+                person_pos = None,
+                ):
         if self.normalize_before:
             raise NotImplementedError
             return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
                                     tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
-                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos, query_sine_embed, is_first)
+                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos, query_sine_embed, is_first, query_person, person_pos)
 
 
 def _get_clones(module, N):

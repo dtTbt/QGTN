@@ -51,43 +51,31 @@ def box_encoder(box, device):  # (xc,yc,w,h) -> (x,y,x,y)
     boxes[:, 2:] = boxes_t[:, :2] + boxes_t[:, 2:] / 2
     return boxes
 
-def get_box_loss(a,b):  # (n,4)
+def get_box_loss(a,b):  # (n*4,)
     x = torch.abs(a-b)
-    index_1 = torch.where(x<1)
-    index_2 = torch.where(x>=1)
-    re = torch.zeros_like(x)
-    # re[index_1] = x[index_1]*x[index_1]*0.5
-    # re[index_2] = torch.abs(x[index_2]) - 0.5
     re = x
     re = torch.sum(re)
     re = re / x.shape[0]
     return re
 
 def get_loss(outputs, targets, device):
-    last_boxes = outputs['boxes']
-    last_scores = outputs['score']
-    aux_outputs = outputs['aux_outputs']
-    layers_boxes = [t['pred_boxes'] for t in aux_outputs]
-    layers_scores = [t['pred_logits'] for t in aux_outputs]
-    layers_boxes.append(last_boxes)
-    layers_scores.append(last_scores)
-    layers_boxes = torch.stack(layers_boxes)  # (n_layers,bs,4)
-    layers_scores = torch.stack(layers_scores)  # (n_layers,bs,4)
+    boxes = outputs['boxes']
 
-    boxes_target = []
+    target_boxes = []
     for target in targets:
-        boxes_target.append(target['box_nml'])
-    boxes_target = torch.stack(boxes_target)
-    boxes_target = box_decoder(boxes_target,device)  # target , (xc,yc,w,h) , (bs,4)
-    boxes_target = boxes_target.repeat(layers_boxes.shape[0],1)
+        target_boxes.append(target['box_nml'])
+    target_boxes = torch.stack(target_boxes,dim=0)
+    target_boxes = box_decoder(target_boxes,device)
+    target_boxes = target_boxes.unsqueeze(dim=0).repeat(boxes.shape[0],1,1)
 
-    boxes = layers_boxes.reshape(-1,4)  # (n_layers*bs,4)
-    scores = layers_scores.reshape(-1)  # (n_layers*bs,)
+    boxes_flat = boxes.reshape(-1)
+    target_boxes_flat = target_boxes.reshape(-1)
 
-    box_loss = get_box_loss(boxes,boxes_target)
-    score_loss = 0
-    return box_loss, score_loss
+    box_loss = get_box_loss(boxes_flat,target_boxes_flat)
 
+    return {
+        'boxes': box_loss
+    }
 
 def target_trs(targets,device):
     for t in targets:
@@ -97,7 +85,7 @@ def target_trs(targets,device):
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0, enable_amp=None, scaler=None):
+                    device: torch.device, epoch: int, max_norm: float = 0, enable_amp=None, scaler=None, auto_amp=False):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -111,7 +99,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples_nes = samples_nes.to(device)
         targets_nes = targets_nes.to(device)
 
-        #targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
         query_boxes_list = []
         image_sizes = []
         for sample in samples:
@@ -122,14 +109,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             box = box.to(device)
             query_boxes_list.append(box)
             image_sizes.append(size)
+        if auto_amp:
+            with amp.autocast(enabled=enable_amp):
+                outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes)
+        else:
+            outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes)
 
-        # with amp.autocast(enabled=enable_amp):
-        #     outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes)
-        outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes)
-
-        target_trs(targets, device)
-        loss_dict = criterion(outputs, targets)
-        weight_dict = criterion.weight_dict
+        loss_dict = get_loss(outputs, targets, device)
+        weight_dict = {
+            'boxes': 40
+        }
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
         # reduce losses over all GPUs for logging purposes
@@ -148,19 +137,20 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             sys.exit(1)
 
         optimizer.zero_grad()
-
-        # scaler.scale(losses).backward()
-        losses.backward()
+        if auto_amp:
+            scaler.scale(losses).backward()
+        else:
+            losses.backward()
         if max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-        # scaler.step(optimizer)
-        # scaler.update()
-        optimizer.step()
+        if auto_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         print_loss = {
-            'ce': loss_dict_reduced_scaled['loss_ce'],
-            'box': loss_dict_reduced_scaled['loss_bbox'],
-            'giou': loss_dict_reduced_scaled['loss_giou'],
+            'box': loss_dict_reduced_scaled['boxes'],
         }
         metric_logger.update(lr=optimizer.param_groups[0]["lr"], loss=loss_value, **print_loss)
     # gather the stats from all processes

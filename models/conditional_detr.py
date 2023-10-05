@@ -48,11 +48,16 @@ class ConditionalDETR(nn.Module):
         self.num_queries = self.max_len_dec
         self.transformer = transformer
         hidden_dim = transformer.d_model
-        self.class_embed = nn.Sequential(nn.Linear(hidden_dim, 32),
+        self.class_embed = nn.Sequential(nn.Linear(hidden_dim * self.num_queries, 64),
                                          nn.ReLU(),
-                                         nn.Linear(32, num_classes)
+                                         nn.Linear(64, 1),
+                                         nn.Sigmoid()
                                          )
-        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.bbox_embed = nn.Sequential(nn.Linear(hidden_dim * self.num_queries, 128),
+                                         nn.ReLU(),
+                                         nn.Linear(128, 4),
+                                         )
+        self.ref_embed = nn.Linear(2 * self.num_queries, 2)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
@@ -62,10 +67,6 @@ class ConditionalDETR(nn.Module):
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         # self.class_embed.bias.data = torch.ones(num_classes) * bias_value
-
-        # init bbox_mebed
-        nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
-        nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
 
         self.roi_pool = MultiScaleRoIAlign(featmap_names=['feat'], output_size=self.query_feat_len, sampling_ratio=2)
 
@@ -87,38 +88,42 @@ class ConditionalDETR(nn.Module):
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(targets)  # gallery
+        pos = pos[-1]  # 位置编码，形状同特征图
+
         query, pos_query = self.backbone(samples)  # query
         query_feat, _ = query[-1].decompose()
         query_feat = self.input_proj(query_feat)  # + pos_query[-1]
-        tgt = self.roi_pool(OrderedDict([["feat", query_feat]]), query_boxes_list, image_sizes)
-        tgt = (tgt.reshape(tgt.shape[0], tgt.shape[1], -1)).permute(2, 0, 1)
-        pos = pos[-1]  # 位置编码，形状同特征图
+        pos_query = pos_query[-1]
+        query_person = self.roi_pool(OrderedDict([["feat", query_feat]]), query_boxes_list, image_sizes)
+        pos_query = self.roi_pool(OrderedDict([["feat", pos_query]]), query_boxes_list, image_sizes)
+        query_person = (query_person.reshape(query_person.shape[0], query_person.shape[1], -1)).permute(2, 0, 1)
+
 
         src, mask = features[-1].decompose()  # src即特征图(bs,c,h,w)。mask(bs,h,w)
         src = self.input_proj(src)  # 通道数由2048缩减为256
         dec_in = self.query_embed.weight  # (max_len,d_model)，d_model为256
         assert mask is not None
-        hs, reference = self.transformer(src, mask, dec_in, pos, tgt)
+        hs, reference = self.transformer(src, mask, dec_in, pos, query_person, pos_query)
         # hs(n_decoder_layers,bs,max_len,d_model)  reference(bs,max_len,2)
+
+        n_layers, bs, n_q, d_model = hs.shape
+        hs = hs.reshape(n_layers, bs, -1)
+
         reference_before_sigmoid = inverse_sigmoid(reference)  # 将sigmoid后的值变回去
-        outputs_coords = []
-        for lvl in range(hs.shape[0]):  # 枚举hs的每一层(decoder)
-            tmp = self.bbox_embed(hs[lvl])  # (bs,max_len,4)
-            tmp[..., :2] += reference_before_sigmoid  # 给中心点加上初始量（即reference point）
-            outputs_coord = tmp.sigmoid()  # 框值缩放到0~1区间
-            outputs_coords.append(outputs_coord)
-        outputs_coord = torch.stack(outputs_coords)  # (n_decoder_layers,bs,max_len,4)
-        # outputs_coord = outputs_coord.to(torch.float32)
+        reference_before_sigmoid = self.ref_embed(reference_before_sigmoid.reshape(bs,-1))
+        reference_before_sigmoid = reference_before_sigmoid.unsqueeze(dim=0).repeat(n_layers,1,1)
+
+        outputs_coord = self.bbox_embed(hs)
+        outputs_coord[..., :2] += reference_before_sigmoid
+        outputs_coord = outputs_coord.sigmoid()
 
         outputs_class = self.class_embed(hs)  # (n_decoder_layers,bs,max_len,1)
         # outputs_class = outputs_class.to(torch.float32)
         out = {
-            'pred_logits': outputs_class[-1],  # (bs,)
-            'pred_boxes': outputs_coord[-1]  # (bs,4)
-        }  # 只取最后一层decoder的结果
+            'scores': outputs_class,
+            'boxes': outputs_coord
+        }
 
-        if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)  # 除最后一个decoder layer的前几个层输出
         return out
 
     @torch.jit.unused

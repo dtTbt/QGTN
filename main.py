@@ -33,12 +33,12 @@ import eval_cuhk
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
-    parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--lr_backbone', default=1e-5, type=float)
+    parser.add_argument('--lr', default=3e-4, type=float)
+    parser.add_argument('--lr_backbone', default=3e-5, type=float)
     parser.add_argument('--batch_size', default=17, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=30, type=int)
-    parser.add_argument('--lr_drop', default=20, type=int)
+    parser.add_argument('--epochs', default=20, type=int)
+    parser.add_argument('--lr_drop', default=15, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
 
@@ -111,10 +111,10 @@ def get_args_parser():
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
-    parser.add_argument('--dist_url', default='172.17.0.5:55568', help='url used to set up distributed training')
+    parser.add_argument('--dist_url', default='env://172.0.0.1:55568', help='url used to set up distributed training')
 
-    parser.add_argument('--pretrain', default='', type=str)
-    parser.add_argument('--eval_pth', default='', type=str)
+    parser.add_argument('--pretrain', default='/QGTN/model_epoch19.pth', type=str)
+    parser.add_argument('--eval_pth', default='/QGTN/model_epoch12.pth', type=str)
     parser.add_argument('--model_save_dir', default='./train_pth', type=str)
 
     return parser
@@ -129,9 +129,6 @@ def resume_pth(ckpt_path, model):
 def main(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
-
-    if args.frozen_weights is not None:
-        assert args.masks, "Frozen training is meant for segmentation only"
     print(args)
 
     device = torch.device(args.device)
@@ -145,13 +142,18 @@ def main(args):
     model, criterion, postprocessors = build_model(args)
     model.to(device)
 
+    model_without_ddp = model
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model_without_ddp = model.module
+
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
     param_dicts = [
-        {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
+        {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and p.requires_grad]},
         {
-            "params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad],
+            "params": [p for n, p in model_without_ddp.named_parameters() if "backbone" in n and p.requires_grad],
             "lr": args.lr_backbone,
         },
     ]
@@ -164,9 +166,14 @@ def main(args):
     dataset_val = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "val100")
     dataset_tv = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "tv100")
 
-    sampler_train = torch.utils.data.RandomSampler(dataset_train)
-    sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-    sampler_tv = torch.utils.data.SequentialSampler(dataset_tv)
+    if args.distributed:
+        sampler_train = DistributedSampler(dataset_train)
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        sampler_tv = torch.utils.data.SequentialSampler(dataset_tv)
+    else:
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        sampler_tv = torch.utils.data.SequentialSampler(dataset_tv)
 
     batch_sampler_train = torch.utils.data.BatchSampler(
         sampler_train, args.batch_size, drop_last=True)
@@ -180,7 +187,7 @@ def main(args):
 
     if args.frozen_weights is not None:
         checkpoint = torch.load(args.frozen_weights, map_location='cpu')
-        model.detr.load_state_dict(checkpoint['model'])
+        model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     enable_amp = True if "cuda" in device.type else False
     scaler = amp.GradScaler(enabled=enable_amp)
@@ -188,11 +195,11 @@ def main(args):
     if args.eval:
         if args.eval_pth:
             resume_pth(args.eval_pth, model)
-        acc_t = eval_cuhk.eval(model, data_loader_tv,device,enable_amp, scaler, use_cache=False, save=True)
+        acc_t = eval_cuhk.eval(model, data_loader_val,device,enable_amp, scaler, use_cache=False, save=True, args=args)
         exit(0)
 
     if args.pretrain:
-        resume_pth(args.pretrain, model)
+        resume_pth(args.pretrain, model_without_ddp)
 
     if os.path.exists(args.model_save_dir):
         shutil.rmtree(args.model_save_dir)
@@ -201,18 +208,27 @@ def main(args):
     print("Start training...")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
+        if args.distributed:
+            sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
             args.clip_max_norm,enable_amp, scaler, auto_amp=True)
         lr_scheduler.step()
-        acc_t = eval_cuhk.eval(model, data_loader_tv, device, enable_amp, scaler, use_cache=False, save=True)
-        acc_t = round(acc_t, 2)
-        print(f'acc_tv: {acc_t}%')
-        if epoch % 2 == 0:
-            acc = eval_cuhk.eval(model, data_loader_val, device, enable_amp, scaler, use_cache=False, save=False)
-            acc = round(acc,2)
-            save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}_{acc}_{acc_t}.pth')
-            torch.save(model.state_dict(), save_path)
+
+        save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}.pth')
+        if utils.is_main_process():
+            torch.save(model_without_ddp.state_dict(), save_path)
+
+        if (epoch + 1) % 3 == 0:
+            acc_t = eval_cuhk.eval(model, data_loader_tv, device, enable_amp, scaler, use_cache=False, save=False, args=args)
+            acc_t = round(acc_t, 2)
+
+            acc = eval_cuhk.eval(model, data_loader_val, device, enable_amp, scaler, use_cache=False, save=False, args=args)
+            acc = round(acc, 2)
+
+            save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}_val{acc}_tv{acc_t}.pth')
+            if utils.is_main_process():
+                torch.save(model_without_ddp.state_dict(), save_path)
             print(f'Model saved at epoch {epoch}.')
 
     total_time = time.time() - start_time

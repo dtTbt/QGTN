@@ -48,16 +48,11 @@ class ConditionalDETR(nn.Module):
         self.num_queries = self.max_len_dec
         self.transformer = transformer
         hidden_dim = transformer.d_model
-        self.class_embed = nn.Sequential(nn.Linear(hidden_dim * self.num_queries, 64),
+        self.class_embed = nn.Sequential(nn.Linear(hidden_dim, 32),
                                          nn.ReLU(),
-                                         nn.Linear(64, 1),
-                                         nn.Sigmoid()
+                                         nn.Linear(32, num_classes)
                                          )
-        self.bbox_embed = nn.Sequential(nn.Linear(hidden_dim * self.num_queries, 128),
-                                         nn.ReLU(),
-                                         nn.Linear(128, 4),
-                                         )
-        self.ref_embed = nn.Linear(2 * self.num_queries, 2)
+        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
@@ -66,11 +61,10 @@ class ConditionalDETR(nn.Module):
         # init prior_prob setting for focal loss
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
-        # self.class_embed.bias.data = torch.ones(num_classes) * bias_value
 
         self.roi_pool = MultiScaleRoIAlign(featmap_names=['feat'], output_size=self.query_feat_len, sampling_ratio=2)
 
-    def forward(self, samples: NestedTensor, targets, query_boxes_list, image_sizes):
+    def forward(self, samples: NestedTensor, targets, query_boxes_list, image_sizes, auto_amp=False):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -107,23 +101,25 @@ class ConditionalDETR(nn.Module):
         # hs(n_decoder_layers,bs,max_len,d_model)  reference(bs,max_len,2)
 
         n_layers, bs, n_q, d_model = hs.shape
-        hs = hs.reshape(n_layers, bs, -1)
 
         reference_before_sigmoid = inverse_sigmoid(reference)  # 将sigmoid后的值变回去
-        reference_before_sigmoid = self.ref_embed(reference_before_sigmoid.reshape(bs,-1))
-        reference_before_sigmoid = reference_before_sigmoid.unsqueeze(dim=0).repeat(n_layers,1,1)
-
-        outputs_coord = self.bbox_embed(hs)
-        outputs_coord[..., :2] += reference_before_sigmoid
-        outputs_coord = outputs_coord.sigmoid()
+        tmp = self.bbox_embed(hs)  # (bs,max_len,4)
+        tmp[..., :2] += reference_before_sigmoid  # 给中心点加上初始量（即reference point）
+        outputs_coord = tmp.sigmoid()  # 框值缩放到0~1区间
 
         outputs_class = self.class_embed(hs)  # (n_decoder_layers,bs,max_len,1)
-        # outputs_class = outputs_class.to(torch.float32)
-        out = {
-            'scores': outputs_class,
-            'boxes': outputs_coord
-        }
 
+        if auto_amp:
+            outputs_coord = outputs_coord.to(torch.float32)
+            outputs_class = outputs_class.to(torch.float32)
+
+        out = {
+            'pred_logits': outputs_class[-1],  # (bs,n_q)
+            'pred_boxes': outputs_coord[-1]  # (bs,n_q,4)
+        }  # 只取最后一层decoder的结果
+
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)  # 除最后一个decoder layer的前几个层输出
         return out
 
     @torch.jit.unused

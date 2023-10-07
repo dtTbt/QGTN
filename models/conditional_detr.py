@@ -14,6 +14,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+import numpy as np
 
 from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -27,6 +28,23 @@ from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
 from .transformer import build_transformer
 from collections import OrderedDict
 from torchvision.ops import MultiScaleRoIAlign
+
+
+def box_encoder(box, device=None):  # (xc,yc,w,h) -> (x,y,x,y)
+    if device == None:
+        device = box.device
+    boxes_t = box
+    boxes = torch.zeros(boxes_t.shape, device=device)
+    boxes[:, :2] = boxes_t[:, :2] - boxes_t[:, 2:] / 2
+    boxes[:, 2:] = boxes_t[:, :2] + boxes_t[:, 2:] / 2
+    return boxes
+
+def xywhn_to_xyxy(boxes, shape):
+    shape_t = shape.flip(0).repeat(2).unsqueeze(dim=0)
+    shape_t = shape_t.to(boxes.device)
+    boxes = box_encoder(boxes)
+    boxes = boxes * shape_t
+    return boxes
 
 
 class ConditionalDETR(nn.Module):
@@ -44,6 +62,7 @@ class ConditionalDETR(nn.Module):
         """
         super().__init__()
         self.query_feat_len = 4
+        self.d_model = 256
         self.max_len_dec = self.query_feat_len * self.query_feat_len
         self.num_queries = self.max_len_dec
         self.transformer = transformer
@@ -64,7 +83,7 @@ class ConditionalDETR(nn.Module):
 
         self.roi_pool = MultiScaleRoIAlign(featmap_names=['feat'], output_size=self.query_feat_len, sampling_ratio=2)
 
-    def forward(self, samples: NestedTensor, targets, query_boxes_list, image_sizes, auto_amp=False):
+    def forward(self, samples: NestedTensor, targets, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=False):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -89,6 +108,7 @@ class ConditionalDETR(nn.Module):
         query_feat = self.input_proj(query_feat)  # + pos_query[-1]
         pos_query = pos_query[-1]
         query_person = self.roi_pool(OrderedDict([["feat", query_feat]]), query_boxes_list, image_sizes)
+        query_person_ori = query_person
         pos_query = self.roi_pool(OrderedDict([["feat", pos_query]]), query_boxes_list, image_sizes)
         query_person = (query_person.reshape(query_person.shape[0], query_person.shape[1], -1)).permute(2, 0, 1)
 
@@ -117,6 +137,18 @@ class ConditionalDETR(nn.Module):
             'pred_logits': outputs_class[-1],  # (bs,n_q)
             'pred_boxes': outputs_coord[-1]  # (bs,n_q,4)
         }  # 只取最后一层decoder的结果
+
+        image_sizes_gallery_single = torch.tensor(image_sizes_gallery[0])
+        boxes_list = [xywhn_to_xyxy(box, image_sizes_gallery_single) for box in out['pred_boxes']]
+        boxes_person = self.roi_pool(OrderedDict([["feat", src]]), boxes_list, image_sizes_gallery)
+        boxes_person_feat_reid = boxes_person.reshape(bs,self.num_queries,-1)
+        boxes_person_feat_reid_T = boxes_person_feat_reid.permute(0,2,1)
+
+        query_person_feat_reid = query_person_ori.reshape(bs, 1, -1)
+
+        reid_scores = torch.matmul(query_person_feat_reid, boxes_person_feat_reid_T).squeeze() / np.sqrt(self.d_model)
+        reid_scores = torch.softmax(reid_scores, dim=-1)
+        out['reid_scores'] = reid_scores
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)  # 除最后一个decoder layer的前几个层输出

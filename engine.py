@@ -80,6 +80,12 @@ def target_trs(targets,device):
         t['labels'] = t['labels'].to(device)
         t['boxes'] = box_decoder(t['box_nml'].unsqueeze(dim=0),device)
 
+def get_reid_loss(a,b):
+    bs, n_q = a.shape
+    re = torch.sum(torch.abs(a-b))
+    re = re / (bs * n_q)
+    return re
+
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -99,7 +105,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         query_boxes_list = []
         image_sizes = []
-        for sample in samples:
+        image_sizes_gallery = []
+        for sample, target in zip(samples, targets):
             box = sample['box']
             size = sample['img_same_shape'].shape[1:]
             size = tuple(size)
@@ -107,15 +114,25 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             box = box.to(device)
             query_boxes_list.append(box)
             image_sizes.append(size)
+            size_gallery = target['img_same_shape'].shape[1:]
+            size_gallery = tuple(size_gallery)
+            image_sizes_gallery.append(size_gallery)
         if auto_amp:
             with amp.autocast(enabled=enable_amp):
-                outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, auto_amp=auto_amp)
+                outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=auto_amp)
         else:
-            outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, auto_amp=auto_amp)
+            outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=auto_amp)
 
         target_trs(targets, device)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
+
+        scores = outputs['pred_logits'][:,:,-1].squeeze()
+        scores_softmax = torch.softmax(scores,dim=-1)
+        reid_scores = outputs['reid_scores']
+        reid_loss = get_reid_loss(scores_softmax, reid_scores)
+        loss_dict['reid_loss'] = reid_loss
+        weight_dict['reid_loss'] = 20
 
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
@@ -157,6 +174,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             'ce': loss_dict_reduced_scaled['loss_ce'],
             'box': loss_dict_reduced_scaled['loss_bbox'],
             'giou': loss_dict_reduced_scaled['loss_giou'],
+            'reid': loss_dict_reduced_scaled['reid_loss'],
         }
         metric_logger.update(lr=optimizer.param_groups[0]["lr"], loss=loss_value, **print_loss)
     # gather the stats from all processes

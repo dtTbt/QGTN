@@ -96,8 +96,8 @@ class CUHKSYSU(BaseDataset):
             protoc = protoc["TestG50"].squeeze()
             for index, item in enumerate(protoc):  # 枚举每一个query人
                 # query
-                # if index >= 100:
-                #     break
+                if index >= 500:
+                    break
                 im_name = str(item["Query"][0, 0][0][0])
                 box = item["Query"][0, 0][1].squeeze().astype(np.int32)
                 box[2:] += box[:2]

@@ -113,7 +113,7 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://172.0.0.1:55568', help='url used to set up distributed training')
 
-    parser.add_argument('--pretrain', default='/QGTN/model_epoch19.pth', type=str)
+    parser.add_argument('--pretrain', default='/QGTN/model_epoch12.pth', type=str)
     parser.add_argument('--eval_pth', default='/QGTN/model_epoch12.pth', type=str)
     parser.add_argument('--model_save_dir', default='./train_pth', type=str)
 
@@ -195,7 +195,7 @@ def main(args):
     if args.eval:
         if args.eval_pth:
             resume_pth(args.eval_pth, model)
-        acc_t = eval_cuhk.eval(model, data_loader_val,device,enable_amp, scaler, use_cache=False, save=True, args=args)
+        acc_t = eval_cuhk.eval(model, data_loader_tv,device,enable_amp, scaler, use_cache=False, save=True, args=args)
         exit(0)
 
     if args.pretrain:
@@ -212,7 +212,7 @@ def main(args):
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm,enable_amp, scaler, auto_amp=True)
+            args.clip_max_norm,enable_amp, scaler, auto_amp=False)
         lr_scheduler.step()
 
         save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}.pth')

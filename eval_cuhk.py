@@ -52,7 +52,7 @@ def draw_boxes(image_path, boxes, output_folder, xyxy, sfx, keep_name, scores_s=
         if scores_s is not None and i < len(scores_s):
             score = scores_s[i][-1].item()  # Convert Torch Tensor to float
             font = ImageFont.load_default()
-            font_size = 10
+            font_size = 20
             draw.text((x1, y1 - font_size), f"{score:.2f}", fill="black", font=font)
             draw.text((x1 + 1, y1 - font_size + 1), f"{score:.2f}", fill="white", font=font)
 
@@ -133,7 +133,9 @@ def post_process(outputs, targets,device):
         boxes_target.append(target['box_nml'])
     boxes_target = torch.stack(boxes_target)  # target , (x,y,x,y) , (bs,4)
 
-    return boxes_out, boxes_target, scores_out, outputs_s, scores_s
+    scores_reid = outputs['reid_scores'].unsqueeze(dim=-1)
+
+    return boxes_out, boxes_target, scores_out, outputs_s, scores_s, scores_reid
 
 def find_query(is_one,targets,boxes):
     true_index = torch.where(is_one == True)
@@ -153,7 +155,7 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
     metric_logger = utils.MetricLogger(delimiter="  ")
     #metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = ''
-    print_freq = 100
+    print_freq = 10
     model.eval()
     cache_path = './eval_cache.pth'
     if use_cache:
@@ -180,7 +182,8 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
             gallery_nes = gallery_nes.to(device)
             query_boxes_list = []
             image_sizes = []
-            for sample in query:
+            image_sizes_gallery = []
+            for sample, target in zip(query, gallery):
                 box = sample['box']
                 size = sample['img_same_shape'].shape[1:]
                 size = tuple(size)
@@ -188,8 +191,14 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
                 box = box.to(device)
                 query_boxes_list.append(box)
                 image_sizes.append(size)
-            outputs = model(query_nes, gallery_nes, query_boxes_list, image_sizes)
-            outputs, targets, scores, outputs_s, scores_s = post_process(outputs, gallery, device)  # (bs,4) (bs,)  这里的targets仍为xyxy
+                size_gallery = target['img_same_shape'].shape[1:]
+                size_gallery = tuple(size_gallery)
+                image_sizes_gallery.append(size_gallery)
+            outputs = model(query_nes, gallery_nes, query_boxes_list, image_sizes, image_sizes_gallery)
+            outputs, targets, scores, outputs_s, scores_s, scores_reid = post_process(outputs, gallery, device)  # 这里的targets仍为xyxy
+            # outputs_s (bs,n_q,4)
+            # scores_s (bs,n_q,2)
+            # scores_reid (bs,n_q,1)
             for index, ps in enumerate(query):
                 all_id.append(ps['id'])
                 exist_ = (not gallery[index]['id'] == -1)
@@ -199,6 +208,9 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
                     draw_boxes(gallery[index]['img_path'], gallery[index]['box_nml'], output_folder, xyxy=True, sfx=str(ps['id']) + '-' + str(index) + '-target', keep_name = False)
                     draw_boxes(gallery[index]['img_path'], outputs[index], output_folder, xyxy=False, sfx=str(ps['id']) + '-' + str(index) + '-box', keep_name = False)
                     draw_boxes(gallery[index]['img_path'], outputs_s[index], output_folder, xyxy=False, sfx=str(ps['id']) + '-' + str(index) + '-boxes', keep_name=False, scores_s=scores_s[index])
+                    draw_boxes(gallery[index]['img_path'], outputs_s[index], output_folder, xyxy=False,
+                               sfx=str(ps['id']) + '-' + str(index) + '-boxes_reid', keep_name=False,
+                               scores_s=scores_reid[index])
             all_box.append(outputs.detach())
             all_score.append(scores.detach())
             all_target.append(targets.detach())

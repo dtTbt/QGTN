@@ -33,8 +33,8 @@ import eval_cuhk
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
-    parser.add_argument('--lr', default=3e-4, type=float)
-    parser.add_argument('--lr_backbone', default=3e-5, type=float)
+    parser.add_argument('--lr', default=2e-4, type=float)
+    parser.add_argument('--lr_backbone', default=2e-5, type=float)
     parser.add_argument('--batch_size', default=17, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=20, type=int)
@@ -113,8 +113,8 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://172.0.0.1:55568', help='url used to set up distributed training')
 
-    parser.add_argument('--pretrain', default='/QGTN/model_epoch12.pth', type=str)
-    parser.add_argument('--eval_pth', default='/QGTN/model_epoch12.pth', type=str)
+    parser.add_argument('--pretrain', default='', type=str)
+    parser.add_argument('--eval_pth', default='/QGTN/model_epoch5_val50.59_tv75.35.pth', type=str)
     parser.add_argument('--model_save_dir', default='./train_pth', type=str)
 
     return parser
@@ -195,7 +195,7 @@ def main(args):
     if args.eval:
         if args.eval_pth:
             resume_pth(args.eval_pth, model)
-        acc_t = eval_cuhk.eval(model, data_loader_tv,device,enable_amp, scaler, use_cache=False, save=True, args=args)
+        acc_t = eval_cuhk.eval(model, data_loader_val,device,enable_amp, scaler, use_cache=False, save=True, args=args)
         exit(0)
 
     if args.pretrain:

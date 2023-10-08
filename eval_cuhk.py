@@ -100,9 +100,11 @@ def get_box_loss(a,b):
     re = re / x.shape[0]
     return re
 
-def post_process(outputs, targets,device):
+def post_process(outputs, targets, reid_top=False):
     scores = outputs['pred_logits']
+    device = scores.device
     boxes = outputs['pred_boxes']
+    scores_reid = outputs['reid_scores'].unsqueeze(dim=-1)
     outputs_s = boxes
     scores = scores.sigmoid()
     scores_s = scores
@@ -110,21 +112,30 @@ def post_process(outputs, targets,device):
     scores_out = []
     for bs_index in range(scores.shape[0]):
         scores_tmp = scores[bs_index]
+        scores_tmp_reid = scores_reid[bs_index]
         boxes_tmp = boxes[bs_index]
         max_score = 0
         max_index = -1
         for n_index in range(scores.shape[1]):
-            if scores_tmp[n_index][0] > scores_tmp[n_index][1]:
-                continue
-            if scores_tmp[n_index][1] > max_score:
-                max_score = scores_tmp[n_index][1]
-                max_index = n_index
+            if reid_top:
+                if scores_tmp_reid[n_index][-1] > max_score:
+                    max_score = scores_tmp_reid[n_index][-1]
+                    max_index = n_index
+            else:
+                if scores_tmp[n_index][0] > scores_tmp[n_index][1]:
+                    continue
+                if scores_tmp[n_index][1] > max_score:
+                    max_score = scores_tmp[n_index][1]
+                    max_index = n_index
         if max_index == -1:
             boxes_out.append(torch.tensor([-1,-1,-1,-1]).to(device))
             scores_out.append(torch.tensor(0).to(device))
         else:
             boxes_out.append(boxes_tmp[max_index])
-            scores_out.append(scores_tmp[max_index][1])
+            if reid_top:
+                scores_out.append(scores_tmp_reid[max_index][-1])
+            else:
+                scores_out.append(scores_tmp[max_index][1])
     boxes_out = torch.stack(boxes_out,dim=0)  # box , (xc,yc,w,h) , (bs,4)
     scores_out = torch.stack(scores_out, dim=0)
 
@@ -132,8 +143,6 @@ def post_process(outputs, targets,device):
     for target in targets:
         boxes_target.append(target['box_nml'])
     boxes_target = torch.stack(boxes_target)  # target , (x,y,x,y) , (bs,4)
-
-    scores_reid = outputs['reid_scores'].unsqueeze(dim=-1)
 
     return boxes_out, boxes_target, scores_out, outputs_s, scores_s, scores_reid
 
@@ -195,7 +204,7 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
                 size_gallery = tuple(size_gallery)
                 image_sizes_gallery.append(size_gallery)
             outputs = model(query_nes, gallery_nes, query_boxes_list, image_sizes, image_sizes_gallery)
-            outputs, targets, scores, outputs_s, scores_s, scores_reid = post_process(outputs, gallery, device)  # 这里的targets仍为xyxy
+            outputs, targets, scores, outputs_s, scores_s, scores_reid = post_process(outputs, gallery, reid_top=False)  # 这里的targets仍为xyxy
             # outputs_s (bs,n_q,4)
             # scores_s (bs,n_q,2)
             # scores_reid (bs,n_q,1)

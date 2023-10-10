@@ -50,38 +50,30 @@ def xywhn_to_xyxy(boxes, shape):
 class ConditionalDETR(nn.Module):
     """ This is the Conditional DETR module that performs object detection """
 
-    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
-        """ Initializes the model.
-        Parameters:
-            backbone: torch module of the backbone to be used. See backbone.py
-            transformer: torch module of the transformer architecture. See transformer.py
-            num_classes: number of object classes
-            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
-                         Conditional DETR can detect in a single image. For COCO, we recommend 100 queries.
-            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
-        """
+    def __init__(self, backbone, transformer, num_classes, aux_loss=False):
         super().__init__()
-        self.query_feat_len = 4
-        self.d_model = 256
-        self.max_len_dec = self.query_feat_len * self.query_feat_len
+        self.query_feat_len = 2
+        self.ratio = 1
+        self.max_len_dec = self.query_feat_len * self.query_feat_len * self.ratio
         self.num_queries = self.max_len_dec
+
         self.transformer = transformer
         hidden_dim = transformer.d_model
+        self.d_model = hidden_dim
         self.class_embed = nn.Sequential(nn.Linear(hidden_dim, 32),
                                          nn.ReLU(),
                                          nn.Linear(32, num_classes)
                                          )
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.query_embed = nn.Embedding(self.num_queries, hidden_dim)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
 
-        # init prior_prob setting for focal loss
-        prior_prob = 0.01
-        bias_value = -math.log((1 - prior_prob) / prior_prob)
-
-        self.roi_pool = MultiScaleRoIAlign(featmap_names=['feat'], output_size=self.query_feat_len, sampling_ratio=2)
+        self.roi_pool = MultiScaleRoIAlign(featmap_names=['feat'],
+                                           output_size=(self.query_feat_len * self.ratio, self.query_feat_len),
+                                           sampling_ratio=2
+        )
 
     def forward(self, samples: NestedTensor, targets, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=False):
         """ The forward expects a NestedTensor, which consists of:
@@ -137,18 +129,6 @@ class ConditionalDETR(nn.Module):
             'pred_logits': outputs_class[-1],  # (bs,n_q)
             'pred_boxes': outputs_coord[-1]  # (bs,n_q,4)
         }  # 只取最后一层decoder的结果
-
-        image_sizes_gallery_single = torch.tensor(image_sizes_gallery[0])
-        boxes_list = [xywhn_to_xyxy(box, image_sizes_gallery_single) for box in out['pred_boxes']]
-        boxes_person = self.roi_pool(OrderedDict([["feat", src]]), boxes_list, image_sizes_gallery)
-        boxes_person_feat_reid = boxes_person.reshape(bs,self.num_queries,-1)
-        boxes_person_feat_reid_T = boxes_person_feat_reid.permute(0,2,1)
-
-        query_person_feat_reid = query_person_ori.reshape(bs, 1, -1)
-
-        reid_scores = torch.matmul(query_person_feat_reid, boxes_person_feat_reid_T).squeeze() / np.sqrt(self.d_model)
-        reid_scores = torch.softmax(reid_scores, dim=-1)
-        out['reid_scores'] = reid_scores
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)  # 除最后一个decoder layer的前几个层输出
@@ -299,7 +279,16 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
-    def forward(self, outputs, targets):
+    def matcher_top(self,outputs):
+        scores = outputs["pred_logits"][:,:,-1]
+        tensor0 = torch.tensor([0])
+        device = tensor0.device
+        max_index = torch.argmax(scores,dim=1)
+        re = [(index.reshape(1).to(device), tensor0) for index in max_index]
+        return re
+
+
+    def forward(self, outputs, targets, top_matcher=False):
         """ This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
@@ -309,7 +298,10 @@ class SetCriterion(nn.Module):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
         # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets)
+        if top_matcher:
+            indices = self.matcher_top(outputs_without_aux)
+        else:
+            indices = self.matcher(outputs_without_aux, targets)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
@@ -412,7 +404,6 @@ def build(args):
         backbone,
         transformer,
         num_classes=num_classes,
-        num_queries=args.num_queries,
         aux_loss=args.aux_loss,
     )
     if args.masks:

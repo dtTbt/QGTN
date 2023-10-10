@@ -4,6 +4,7 @@ import os.path as osp
 import numpy as np
 import torch
 from scipy.io import loadmat
+from PIL import Image
 
 from .base import BaseDataset
 
@@ -13,6 +14,16 @@ class CUHKSYSU(BaseDataset):
         self.name = "CUHK-SYSU"
         self.img_prefix = osp.join(root, "Image", "SSM")
         super(CUHKSYSU, self).__init__(root, transforms, split)
+
+    def get_train_img_name(self):  # 返回需要的图片名
+        gallery_imgs = loadmat(osp.join(self.root, "annotation", "pool.mat"))
+        gallery_imgs = gallery_imgs["pool"].squeeze()
+        gallery_imgs = [str(a[0]) for a in gallery_imgs]
+        all_imgs = loadmat(osp.join(self.root, "annotation", "Images.mat"))
+        all_imgs = all_imgs["Img"].squeeze()
+        all_imgs = [str(a[0][0]) for a in all_imgs]
+        training_imgs = sorted(list(set(all_imgs) - set(gallery_imgs)))
+        return training_imgs
 
     def get_train_data_index(self, n):
         index = []
@@ -28,6 +39,24 @@ class CUHKSYSU(BaseDataset):
         for i in range(n)[:-1]:
             index.append([0,i+1,1])
         return index
+
+    def get_image_dimensions(self, image_path):
+        with Image.open(image_path) as img:
+            width, height = img.size
+            return height, width
+
+    def generate_random_boxes(self, image_height, image_width, num_boxes):
+        boxes = np.zeros((num_boxes, 4), dtype=np.int32)
+
+        for i in range(num_boxes):
+            x1 = np.random.randint(0, image_width)
+            y1 = np.random.randint(0, image_height)
+            x2 = np.random.randint(x1, image_width)
+            y2 = np.random.randint(y1, image_height)
+
+            boxes[i] = [x1, y1, x2, y2]
+
+        return boxes
 
     def _load_annotations(self):
         if self.split == "train":
@@ -154,4 +183,21 @@ class CUHKSYSU(BaseDataset):
                 for train_data_index in train_data_indexes:
                     index_l, index_r, is_one = train_data_index
                     train_data.append([train_gallery[index_l],train_gallery[index_r],is_one])
+            return train_data
+        elif self.split == "pretrain":
+            img_names = self.get_train_img_name()
+            train_data = []
+            for index, img_name in enumerate(img_names):  # 枚举每个人，从0开始编号
+                img_path = os.path.join(self.img_prefix, img_name)
+                h, w = self.get_image_dimensions(img_path)
+                boxes = self.generate_random_boxes(h, w, 10)
+                for box in boxes:
+                    box = box.astype(np.int32)
+                    tmp = {
+                        'id': -2,
+                        'img_name': img_name,
+                        'box': box,
+                        'img_path': img_path
+                    }
+                    train_data.append([tmp,tmp,1])
             return train_data

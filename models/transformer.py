@@ -47,7 +47,7 @@ def gen_sineembed_for_position(pos_tensor):
 
 class Transformer(nn.Module):
 
-    def __init__(self, d_model=512, nhead=8, num_queries=16, num_encoder_layers=6,
+    def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
                  num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False,
                  return_intermediate_dec=False):
@@ -413,8 +413,6 @@ def build_transformer(args):
     return Transformer(
         d_model=args.hidden_dim,
         dropout=args.dropout,
-        nhead=args.nheads,
-        num_queries=args.num_queries,
         dim_feedforward=args.dim_feedforward,
         num_encoder_layers=args.enc_layers,
         num_decoder_layers=args.dec_layers,

@@ -33,8 +33,8 @@ import eval_cuhk
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
-    parser.add_argument('--lr', default=2e-4, type=float)
-    parser.add_argument('--lr_backbone', default=2e-5, type=float)
+    parser.add_argument('--lr', default=3e-4, type=float)
+    parser.add_argument('--lr_backbone', default=3e-5, type=float)
     parser.add_argument('--batch_size', default=17, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=20, type=int)
@@ -66,8 +66,6 @@ def get_args_parser():
                         help="Dropout applied in the transformer")
     parser.add_argument('--nheads', default=8, type=int,
                         help="Number of attention heads inside the transformer's attentions")
-    parser.add_argument('--num_queries', default=16, type=int,
-                        help="Number of query slots")
     parser.add_argument('--pre_norm', action='store_true')
 
     # * Segmentation
@@ -113,8 +111,10 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://172.0.0.1:55568', help='url used to set up distributed training')
 
-    parser.add_argument('--pretrain', default='', type=str)
-    parser.add_argument('--eval_pth', default='/QGTN/model_epoch5_val50.59_tv75.35.pth', type=str)
+    parser.add_argument('--pretrain', default=True)
+
+    parser.add_argument('--ctn', default='', type=str)
+    parser.add_argument('--eval_pth', default='', type=str)
     parser.add_argument('--model_save_dir', default='./train_pth', type=str)
 
     return parser
@@ -127,8 +127,8 @@ def resume_pth(ckpt_path, model):
 
 
 def main(args):
+    global dataset_pretrain, sampler_pretrain, batch_sampler_pretrain, data_loader_pretrain
     utils.init_distributed_mode(args)
-    print("git:\n  {}\n".format(utils.get_sha()))
     print(args)
 
     device = torch.device(args.device)
@@ -165,21 +165,34 @@ def main(args):
     dataset_train = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=True), "train")
     dataset_val = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "val100")
     dataset_tv = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "tv100")
+    if args.pretrain:
+        dataset_pretrain = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=True), "pretrain")
 
     if args.distributed:
         sampler_train = DistributedSampler(dataset_train)
+        if args.pretrain:
+            sampler_pretrain = DistributedSampler(dataset_pretrain)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
         sampler_tv = torch.utils.data.SequentialSampler(dataset_tv)
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        if args.pretrain:
+            sampler_pretrain = torch.utils.data.RandomSampler(dataset_pretrain)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
         sampler_tv = torch.utils.data.SequentialSampler(dataset_tv)
 
     batch_sampler_train = torch.utils.data.BatchSampler(
         sampler_train, args.batch_size, drop_last=True)
 
+    if args.pretrain:
+        batch_sampler_pretrain = torch.utils.data.BatchSampler(
+            sampler_pretrain, args.batch_size, drop_last=True)
+
     data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
                                    collate_fn=collate_fn, num_workers=args.num_workers)
+    if args.pretrain:
+        data_loader_pretrain = DataLoader(dataset_pretrain, batch_sampler=batch_sampler_pretrain,
+                                       collate_fn=collate_fn, num_workers=args.num_workers)
     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                  drop_last=False, collate_fn=collate_fn, num_workers=args.num_workers)
     data_loader_tv = DataLoader(dataset_tv, args.batch_size, sampler=sampler_tv,
@@ -198,8 +211,8 @@ def main(args):
         acc_t = eval_cuhk.eval(model, data_loader_val,device,enable_amp, scaler, use_cache=False, save=True, args=args)
         exit(0)
 
-    if args.pretrain:
-        resume_pth(args.pretrain, model_without_ddp)
+    if args.ctn:
+        resume_pth(args.ctn, model_without_ddp)
 
     if os.path.exists(args.model_save_dir):
         shutil.rmtree(args.model_save_dir)
@@ -210,16 +223,23 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm,enable_amp, scaler, auto_amp=False)
+        if args.pretrain:
+            train_stats = train_one_epoch(
+                model, criterion, data_loader_pretrain, optimizer, device, epoch,
+                args.clip_max_norm, enable_amp, scaler, auto_amp=False)
+        else:
+            train_stats = train_one_epoch(
+                model, criterion, data_loader_train, optimizer, device, epoch,
+                args.clip_max_norm,enable_amp, scaler, auto_amp=False)
         lr_scheduler.step()
 
-        save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}.pth')
         if utils.is_main_process():
+            save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}.pth')
             torch.save(model_without_ddp.state_dict(), save_path)
 
-        if (epoch + 1) % 3 == 0:
+        # if args.pretrain:
+        #     continue
+        if (epoch + 1) % 3 == 0 and utils.is_main_process():
             acc_t = eval_cuhk.eval(model, data_loader_tv, device, enable_amp, scaler, use_cache=False, save=False, args=args)
             acc_t = round(acc_t, 2)
 
@@ -227,8 +247,8 @@ def main(args):
             acc = round(acc, 2)
 
             save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}_val{acc}_tv{acc_t}.pth')
-            if utils.is_main_process():
-                torch.save(model_without_ddp.state_dict(), save_path)
+
+            torch.save(model_without_ddp.state_dict(), save_path)
             print(f'Model saved at epoch {epoch}.')
 
     total_time = time.time() - start_time

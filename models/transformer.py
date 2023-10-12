@@ -296,9 +296,7 @@ class TransformerDecoderLayer(nn.Module):
         # ========== Begin of Self-Attention =============
         # Apply projections here
         # shape: num_queries x batch_size x 256
-        query_person = query_person + person_pos
-
-        tgt = tgt + query_person
+        query_person = query_person + person_pos  # (1, bs, d_model)
 
         q_content = self.sa_qcontent_proj(tgt)  # 维度不变 (n_q,bs,d_model)
         q_pos = self.sa_qpos_proj(query_pos)  # query_pos是随机。维度不变 (n_q,bs,d_model)
@@ -325,6 +323,8 @@ class TransformerDecoderLayer(nn.Module):
         q_content = self.ca_qcontent_proj(tgt)
         k_content = self.ca_kcontent_proj(memory)
         v = self.ca_v_proj(memory)
+
+        q_content = q_content + query_person
 
         num_queries, bs, n_model = q_content.shape
         hw, _, _ = k_content.shape

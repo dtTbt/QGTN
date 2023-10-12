@@ -50,12 +50,13 @@ def xywhn_to_xyxy(boxes, shape):
 class ConditionalDETR(nn.Module):
     """ This is the Conditional DETR module that performs object detection """
 
-    def __init__(self, backbone, transformer, num_classes, aux_loss=False):
+    def __init__(self, backbone, transformer, num_classes, aux_loss=False, args=None):
         super().__init__()
-        self.query_feat_len = 2
-        self.ratio = 1
-        self.max_len_dec = self.query_feat_len * self.query_feat_len * self.ratio
-        self.num_queries = self.max_len_dec
+        self.query_feat_len = 1
+        if args.mode == 'full':
+            self.num_queries = 70
+        else:
+            self.num_queries = 12
 
         self.transformer = transformer
         hidden_dim = transformer.d_model
@@ -71,7 +72,7 @@ class ConditionalDETR(nn.Module):
         self.aux_loss = aux_loss
 
         self.roi_pool = MultiScaleRoIAlign(featmap_names=['feat'],
-                                           output_size=(self.query_feat_len * self.ratio, self.query_feat_len),
+                                           output_size=(self.query_feat_len, self.query_feat_len),
                                            sampling_ratio=2
         )
 
@@ -100,7 +101,6 @@ class ConditionalDETR(nn.Module):
         query_feat = self.input_proj(query_feat)  # + pos_query[-1]
         pos_query = pos_query[-1]
         query_person = self.roi_pool(OrderedDict([["feat", query_feat]]), query_boxes_list, image_sizes)
-        query_person_ori = query_person
         pos_query = self.roi_pool(OrderedDict([["feat", pos_query]]), query_boxes_list, image_sizes)
         query_person = (query_person.reshape(query_person.shape[0], query_person.shape[1], -1)).permute(2, 0, 1)
 
@@ -393,7 +393,11 @@ def build(args):
     # you should pass `num_classes` to be 2 (max_obj_id + 1).
     # For more details on this, check the following discussion
     # https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
-    num_classes = 2
+    if args.mode == 'full':
+        num_classes = args.num_class
+    else:
+        num_classes = args.num_class - 1
+
     device = torch.device(args.device)
 
     backbone = build_backbone(args)
@@ -405,6 +409,7 @@ def build(args):
         transformer,
         num_classes=num_classes,
         aux_loss=args.aux_loss,
+        args=args
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))

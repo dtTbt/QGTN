@@ -75,10 +75,14 @@ def get_loss(outputs, targets, device):
         'boxes': box_loss
     }
 
-def target_trs(targets,device):
+def target_trs(targets,device,mode):
     for t in targets:
-        t['labels'] = t['labels'].to(device)
-        t['boxes'] = box_decoder(t['box_nml'].unsqueeze(dim=0),device)
+        if mode == 'full':
+            t['labels'] = t['labels'].to(device)
+            t['boxes'] = box_decoder(t['boxes_nml'],device)
+        else:
+            t['labels'] = t['target_labels'].to(device)
+            t['boxes'] = box_decoder(t['target_boxes_nml'],device)
 
 def get_reid_loss(a,b):
     bs, n_q = a.shape
@@ -89,7 +93,7 @@ def get_reid_loss(a,b):
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0, enable_amp=None, scaler=None, auto_amp=False):
+                    device: torch.device, epoch: int, max_norm: float = 0, enable_amp=None, scaler=None, auto_amp=False, args=None):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -107,23 +111,25 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         image_sizes = []
         image_sizes_gallery = []
         for sample, target in zip(samples, targets):
-            box = sample['box']
+            box = sample['boxes']
             size = sample['img_same_shape'].shape[1:]
             size = tuple(size)
-            box = box.unsqueeze(dim=0)
             box = box.to(device)
             query_boxes_list.append(box)
             image_sizes.append(size)
             size_gallery = target['img_same_shape'].shape[1:]
             size_gallery = tuple(size_gallery)
             image_sizes_gallery.append(size_gallery)
+
         if auto_amp:
             with amp.autocast(enabled=enable_amp):
                 outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=auto_amp)
         else:
             outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=auto_amp)
 
-        target_trs(targets, device)
+        assert (outputs['pred_boxes'] >= 0).all()
+
+        target_trs(targets, device, mode = args.mode)
         loss_dict = criterion(outputs, targets, top_matcher=False)
         weight_dict = criterion.weight_dict
 

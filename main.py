@@ -33,14 +33,15 @@ import eval_cuhk
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
-    parser.add_argument('--lr', default=3e-4, type=float)
-    parser.add_argument('--lr_backbone', default=3e-5, type=float)
+    parser.add_argument('--lr', default=1e-4, type=float)
+    parser.add_argument('--lr_backbone', default=1e-5, type=float)
     parser.add_argument('--batch_size', default=17, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=20, type=int)
-    parser.add_argument('--lr_drop', default=15, type=int)
+    parser.add_argument('--epochs', default=15, type=int)
+    parser.add_argument('--lr_drop', default=10, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
+    parser.add_argument('--num_class', default=3, type=int)
 
     # Model parameters
     parser.add_argument('--frozen_weights', type=str, default=None,
@@ -54,9 +55,9 @@ def get_args_parser():
                         help="Type of positional embedding to use on top of the image features")
 
     # * Transformer
-    parser.add_argument('--enc_layers', default=3, type=int,
+    parser.add_argument('--enc_layers', default=0, type=int,
                         help="Number of encoding layers in the transformer")
-    parser.add_argument('--dec_layers', default=6, type=int,
+    parser.add_argument('--dec_layers', default=4, type=int,
                         help="Number of decoding layers in the transformer")
     parser.add_argument('--dim_feedforward', default=2048, type=int,
                         help="Intermediate size of the feedforward layers in the transformer blocks")
@@ -105,13 +106,14 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
+    parser.add_argument('--etv', action='store_true')
     parser.add_argument('--num_workers', default=2, type=int)
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://172.0.0.1:55568', help='url used to set up distributed training')
 
-    parser.add_argument('--pretrain', default=True)
+    parser.add_argument('--mode', default='one', type=str, help='full or one')
 
     parser.add_argument('--ctn', default='', type=str)
     parser.add_argument('--eval_pth', default='', type=str)
@@ -162,37 +164,24 @@ def main(args):
 
     #dataset_train = build_dataset('CUHK-SYSU', '/CUHK-SYSU', make_coco_transforms('train'), "train", )
 
-    dataset_train = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=True), "train")
-    dataset_val = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "val100")
-    dataset_tv = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "tv100")
-    if args.pretrain:
-        dataset_pretrain = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=True), "pretrain")
+    dataset_train_full = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=True), "train_full")
+    dataset_val = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "val")
+    dataset_tv = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "train_val")
 
     if args.distributed:
-        sampler_train = DistributedSampler(dataset_train)
-        if args.pretrain:
-            sampler_pretrain = DistributedSampler(dataset_pretrain)
+        sampler_train_full = DistributedSampler(dataset_train_full)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
         sampler_tv = torch.utils.data.SequentialSampler(dataset_tv)
     else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        if args.pretrain:
-            sampler_pretrain = torch.utils.data.RandomSampler(dataset_pretrain)
+        sampler_train_full = torch.utils.data.RandomSampler(dataset_train_full)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
         sampler_tv = torch.utils.data.SequentialSampler(dataset_tv)
 
-    batch_sampler_train = torch.utils.data.BatchSampler(
-        sampler_train, args.batch_size, drop_last=True)
+    batch_sampler_train_full = torch.utils.data.BatchSampler(
+        sampler_train_full, args.batch_size, drop_last=True)
 
-    if args.pretrain:
-        batch_sampler_pretrain = torch.utils.data.BatchSampler(
-            sampler_pretrain, args.batch_size, drop_last=True)
-
-    data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
+    data_loader_train_full = DataLoader(dataset_train_full, batch_sampler=batch_sampler_train_full,
                                    collate_fn=collate_fn, num_workers=args.num_workers)
-    if args.pretrain:
-        data_loader_pretrain = DataLoader(dataset_pretrain, batch_sampler=batch_sampler_pretrain,
-                                       collate_fn=collate_fn, num_workers=args.num_workers)
     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                  drop_last=False, collate_fn=collate_fn, num_workers=args.num_workers)
     data_loader_tv = DataLoader(dataset_tv, args.batch_size, sampler=sampler_tv,
@@ -211,6 +200,12 @@ def main(args):
         acc_t = eval_cuhk.eval(model, data_loader_val,device,enable_amp, scaler, use_cache=False, save=True, args=args)
         exit(0)
 
+    if args.etv:
+        if args.eval_pth:
+            resume_pth(args.eval_pth, model)
+        acc_t = eval_cuhk.eval(model, data_loader_tv,device,enable_amp, scaler, use_cache=False, save=True, args=args)
+        exit(0)
+
     if args.ctn:
         resume_pth(args.ctn, model_without_ddp)
 
@@ -222,34 +217,30 @@ def main(args):
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
-            sampler_train.set_epoch(epoch)
-        if args.pretrain:
-            train_stats = train_one_epoch(
-                model, criterion, data_loader_pretrain, optimizer, device, epoch,
-                args.clip_max_norm, enable_amp, scaler, auto_amp=False)
-        else:
-            train_stats = train_one_epoch(
-                model, criterion, data_loader_train, optimizer, device, epoch,
-                args.clip_max_norm,enable_amp, scaler, auto_amp=False)
+            sampler_train_full.set_epoch(epoch)
+
+        train_one_epoch(
+            model, criterion, data_loader_train_full, optimizer, device, epoch,
+            args.clip_max_norm, enable_amp, scaler, auto_amp=False, args=args
+        )
+
         lr_scheduler.step()
 
         if utils.is_main_process():
             save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}.pth')
             torch.save(model_without_ddp.state_dict(), save_path)
 
-        # if args.pretrain:
-        #     continue
-        if (epoch + 1) % 3 == 0 and utils.is_main_process():
-            acc_t = eval_cuhk.eval(model, data_loader_tv, device, enable_amp, scaler, use_cache=False, save=False, args=args)
-            acc_t = round(acc_t, 2)
-
-            acc = eval_cuhk.eval(model, data_loader_val, device, enable_amp, scaler, use_cache=False, save=False, args=args)
-            acc = round(acc, 2)
-
-            save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}_val{acc}_tv{acc_t}.pth')
-
-            torch.save(model_without_ddp.state_dict(), save_path)
-            print(f'Model saved at epoch {epoch}.')
+        # if (epoch + 1) % 3 == 0:
+        #     acc_t = eval_cuhk.eval(model, data_loader_tv, device, enable_amp, scaler, use_cache=False, save=False, args=args)
+        #     acc_t = round(acc_t, 2)
+        #
+        #     acc = eval_cuhk.eval(model, data_loader_val, device, enable_amp, scaler, use_cache=False, save=False, args=args)
+        #     acc = round(acc, 2)
+        #
+        #     if utils.is_main_process():
+        #         save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}_val{acc}_tv{acc_t}.pth')
+        #         torch.save(model_without_ddp.state_dict(), save_path)
+        #         print(f'Model saved at epoch {epoch}.')
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

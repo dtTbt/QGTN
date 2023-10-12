@@ -33,9 +33,15 @@ class ToTensor:
         # convert [0, 255] to [0, 1]
         image['img'] = F.to_tensor(image['img'])
         target['img'] = F.to_tensor(target['img'])
-        image['box_nml'] = image['box'] / (torch.flip(torch.tensor(image['img'].shape[1:]),dims=[0])).repeat(2)
-        target['box_nml'] = target['box'] / (torch.flip(torch.tensor(target['img'].shape[1:]), dims=[0])).repeat(2)
-        assert (target['box_nml'][2:] >= target['box_nml'][:2]).all()
+
+        image['boxes_nml'] = image['boxes'] / (torch.flip(torch.tensor(image['img'].shape[1:]),dims=[0])).repeat(2).reshape(1,4)
+        target['boxes_nml'] = target['boxes'] / (torch.flip(torch.tensor(target['img'].shape[1:]), dims=[0])).repeat(2).reshape(1,4)
+        target['target_boxes_nml'] = target['target_boxes'] / (torch.flip(torch.tensor(target['img'].shape[1:]), dims=[0])).repeat(2).reshape(1, 4)
+
+        assert (image['boxes_nml'][:, 2:] >= image['boxes_nml'][:, :2]).all()
+        assert (target['boxes_nml'][:, 2:] >= target['boxes_nml'][:, :2]).all()
+        assert (target['target_boxes_nml'][:, 2:] >= target['target_boxes_nml'][:, :2]).all()
+
         return image, target
 
 

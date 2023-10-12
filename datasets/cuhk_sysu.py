@@ -15,10 +15,13 @@ class CUHKSYSU(BaseDataset):
         self.img_prefix = osp.join(root, "Image", "SSM")
         super(CUHKSYSU, self).__init__(root, transforms, split)
 
-    def get_train_img_name(self):  # 返回需要的图片名
+    def get_img_name(self):  # 返回需要的图片名
         gallery_imgs = loadmat(osp.join(self.root, "annotation", "pool.mat"))
         gallery_imgs = gallery_imgs["pool"].squeeze()
         gallery_imgs = [str(a[0]) for a in gallery_imgs]
+        if self.split == "val":
+            return gallery_imgs
+
         all_imgs = loadmat(osp.join(self.root, "annotation", "Images.mat"))
         all_imgs = all_imgs["Img"].squeeze()
         all_imgs = [str(a[0][0]) for a in all_imgs]
@@ -29,15 +32,15 @@ class CUHKSYSU(BaseDataset):
         index = []
         for i in range(n):
             for j in range(n):
-                if i == j:
-                    continue
-                index.append([i,j,1])
+                # if i == j:
+                #     continue
+                index.append([i, j])
         return index
 
-    def get_test_data_index(self,n):
+    def get_test_data_index(self, n):
         index = []
         for i in range(n)[:-1]:
-            index.append([0,i+1,1])
+            index.append([0, i + 1])
         return index
 
     def get_image_dimensions(self, image_path):
@@ -58,146 +61,146 @@ class CUHKSYSU(BaseDataset):
 
         return boxes
 
-    def _load_annotations(self):
-        if self.split == "train":
-            train_data = []
+    def load_img(self):
+        def set_box_pid(boxes, box, pids, pid):  # 在一张图片的boxes中找到匹配的box，然后赋值pid
+            for i in range(boxes.shape[0]):
+                if np.all(boxes[i] == box):
+                    pids[i] = pid
+                    return
+
+        all_imgs = loadmat(osp.join(self.root, "annotation", "Images.mat"))
+        all_imgs = all_imgs["Img"].squeeze()
+        name_to_boxes = {}
+        name_to_pids = {}
+        unlabeled_pid = 5555  # default pid for unlabeled people
+        for img_name, _, boxes in all_imgs:  # 枚举每张图片
+            img_name = str(img_name[0])
+            boxes = np.asarray([b[0] for b in boxes[0]])
+            boxes = boxes.reshape(boxes.shape[0], 4)  # (x1, y1, w, h)
+            valid_index = np.where((boxes[:, 2] > 0) & (boxes[:, 3] > 0))[0]
+            assert valid_index.size > 0, "Warning: {} has no valid boxes.".format(img_name)
+            boxes = boxes[valid_index]
+            name_to_boxes[img_name] = boxes.astype(np.int32)  # 每张图片的所有框
+            name_to_pids[img_name] = unlabeled_pid * np.ones(boxes.shape[0], dtype=np.int32)  # 所有框id全部赋为5555
+
+        if self.split == 'val':
+            protoc = loadmat(osp.join(self.root, "annotation/test/train_test/TestG50.mat"))
+            protoc = protoc["TestG50"].squeeze()
+            for index, item in enumerate(protoc):  # 枚举每一个query人
+                im_name = str(item["Query"][0, 0][0][0])
+                box = item["Query"][0, 0][1].squeeze().astype(np.int32)
+                set_box_pid(name_to_boxes[im_name], box, name_to_pids[im_name], index + 1)  # 为查询框编号
+                gallery = item["Gallery"].squeeze()
+                for im_name, box, _ in gallery:  # 枚举gallery中每张图片（50张）
+                    im_name = str(im_name[0])
+                    if box.size == 0:  # 因为gallery中只有前几张图片是存在这个人的，后面的没有这人
+                        break
+                    box = box.squeeze().astype(np.int32)
+                    set_box_pid(name_to_boxes[im_name], box, name_to_pids[im_name], index + 1)  # 为gallery中这人框编号
+        else:
             train = loadmat(osp.join(self.root, "annotation/test/train_test/Train.mat"))
             train = train["Train"].squeeze()
             for index, item in enumerate(train):  # 枚举每个人，从0开始编号
                 scenes = item[0, 0][2].squeeze()
-                train_gallery = []
                 for img_name, box, _ in scenes:  # 枚举这个人的每一次出现（出现在的图片与图片中的位置）
                     img_name = str(img_name[0])
                     box = box.squeeze().astype(np.int32)
+                    set_box_pid(name_to_boxes[img_name], box, name_to_pids[img_name], index + 1)  # 为每一次出现的框都编号
+
+        annotations = {}
+        img_names = self.get_img_name()  # 获取需要的图片名,val or train
+        max_person_num = 0
+        for img_name in img_names:
+            boxes = name_to_boxes[img_name]
+            boxes[:, 2:] += boxes[:, :2]  # (x1, y1, w, h) -> (x1, y1, x2, y2)
+            pids = name_to_pids[img_name]
+            annotations[img_name] = {
+                "img_name": img_name,
+                "img_path": osp.join(self.img_prefix, img_name),
+                "boxes": boxes,
+                "pids": pids,
+            }
+            max_person_num = max(max_person_num, len(pids))
+        return annotations, max_person_num
+
+    def _load_annotations(self):
+        imgs_set, _ = self.load_img()
+        if self.split == "train_full" or self.split == "train_val":
+            train_data = []
+            train = loadmat(osp.join(self.root, "annotation/test/train_test/Train.mat"))
+            train = train["Train"].squeeze()
+            for index, item in enumerate(train):  # 枚举每个人，从0开始编号
+                if self.split == "train_val" and index >= 100:
+                    break
+                pid = index + 1
+                scenes = item[0, 0][2].squeeze()
+                train_gallery = []
+                train_query = []
+                for img_name, box, _ in scenes:  # 枚举这个人的每一次出现（出现在的图片与图片中的位置）
+                    img_name = str(img_name[0])
+
+                    box = box.squeeze().astype(np.int32)
                     box[2:] += box[:2]
-                    assert (box[2:] >= box[:2]).all()
-                    train_gallery.append({
-                        'id': index,
+                    box = box.reshape(1, 4)
+                    train_query.append({
                         'img_name': img_name,
-                        'box': box,
+                        'pids': np.array([pid]),  # ndarray (1,)
+                        'boxes': box,  # ndarray (1,4)
                         'img_path': os.path.join(self.img_prefix, img_name),
                     })
-                train_data_indexes=self.get_train_data_index(len(train_gallery))
+
+                    gallery_img = imgs_set[img_name]
+                    boxes = gallery_img['boxes']
+                    pids = gallery_img['pids']
+                    train_gallery.append({
+                        'img_name': img_name,
+                        'pids': pids,  # ndarray (n,)
+                        'boxes': boxes,  # ndarray (n,4)
+                        'img_path': os.path.join(self.img_prefix, img_name),
+                        'exist': True,
+                    })
+                train_data_indexes = self.get_train_data_index(len(scenes))
                 for train_data_index in train_data_indexes:
-                    index_l, index_r, is_one = train_data_index
-                    train_data.append([train_gallery[index_l],train_gallery[index_r],is_one])
+                    index_l, index_r = train_data_index
+                    train_data.append([train_query[index_l], train_gallery[index_r]])
             return train_data
         elif self.split == "val":
             test_data = []
             protoc = loadmat(osp.join(self.root, "annotation/test/train_test/TestG50.mat"))
             protoc = protoc["TestG50"].squeeze()
             for index, item in enumerate(protoc):  # 枚举每一个query人
-                # query
-                im_name = str(item["Query"][0, 0][0][0])
-                box = item["Query"][0, 0][1].squeeze().astype(np.int32)
-                box[2:] += box[:2]
-                test_gallery = []
-                test_gallery.append({
-                    'id': index,
-                    'img_name': im_name,
-                    'box': box,
-                    'img_path': os.path.join(self.img_prefix, im_name)
-                })
-                # gallery
-                gallery = item["Gallery"].squeeze()
-                for im_name, box, _ in gallery:  # 枚举gallery中每张图片（50张）
-                    im_name = str(im_name[0])
-                    box = box.squeeze().astype(np.int32)
-                    box[2:] += box[:2]
-                    idd = index
-                    if len(box) == 0:
-                        box = np.array([1,1,1,1])
-                        idd = -1
-                    test_gallery.append({
-                        'id': idd,
-                        'img_name': im_name,
-                        'box': box,
-                        'img_path': os.path.join(self.img_prefix, im_name)
-                    })
-                test_data_indexes=self.get_test_data_index(len(test_gallery))
-                for test_data_index in test_data_indexes:
-                    index_l, index_r, is_one = test_data_index
-                    test_data.append([test_gallery[index_l],test_gallery[index_r],is_one])
-            return test_data
-        elif self.split == "val100":
-            test_data = []
-            protoc = loadmat(osp.join(self.root, "annotation/test/train_test/TestG50.mat"))
-            protoc = protoc["TestG50"].squeeze()
-            for index, item in enumerate(protoc):  # 枚举每一个query人
-                # query
-                if index >= 200:
+                pid = index + 1
+                if index >= 100:  #
                     break
                 im_name = str(item["Query"][0, 0][0][0])
                 box = item["Query"][0, 0][1].squeeze().astype(np.int32)
                 box[2:] += box[:2]
+                box = box.reshape(1, 4)
                 test_gallery = []
                 test_gallery.append({
-                    'id': index,
+                    'pids': np.array([pid]),
                     'img_name': im_name,
-                    'box': box,
+                    'boxes': box,
                     'img_path': os.path.join(self.img_prefix, im_name)
                 })
                 # gallery
                 gallery = item["Gallery"].squeeze()
                 for im_name, box, _ in gallery:  # 枚举gallery中每张图片（50张）
-                    im_name = str(im_name[0])
-                    box = box.squeeze().astype(np.int32)
-                    box[2:] += box[:2]
-                    idd = index
-                    if len(box) == 0:
-                        box = np.array([1,1,1,1])
-                        idd = -1
+                    img_name = str(im_name[0])
+                    if box.shape[-1] == 0:  # 因为gallery中只有前几张图片是存在这个人的，后面的没有这人
                         break
+                    gallery_img = imgs_set[img_name]
+                    boxes = gallery_img['boxes']
+                    pids = gallery_img['pids']
                     test_gallery.append({
-                        'id': idd,
-                        'img_name': im_name,
-                        'box': box,
-                        'img_path': os.path.join(self.img_prefix, im_name)
-                    })
-                test_data_indexes=self.get_test_data_index(len(test_gallery))
-                for test_data_index in test_data_indexes:
-                    index_l, index_r, is_one = test_data_index
-                    test_data.append([test_gallery[index_l],test_gallery[index_r],is_one])
-            return test_data
-        elif self.split == 'tv100':
-            train_data = []
-            train = loadmat(osp.join(self.root, "annotation/test/train_test/Train.mat"))
-            train = train["Train"].squeeze()
-            for index, item in enumerate(train):  # 枚举每个人，从0开始编号
-                if index >= 100:
-                    break
-                scenes = item[0, 0][2].squeeze()
-                train_gallery = []
-                for img_name, box, _ in scenes:  # 枚举这个人的每一次出现（出现在的图片与图片中的位置）
-                    img_name = str(img_name[0])
-                    box = box.squeeze().astype(np.int32)
-                    box[2:] += box[:2]
-                    assert (box[2:] >= box[:2]).all()
-                    train_gallery.append({
-                        'id': index,
                         'img_name': img_name,
-                        'box': box,
+                        'pids': pids,  # ndarray (n,)
+                        'boxes': boxes,  # ndarray (n,4)
                         'img_path': os.path.join(self.img_prefix, img_name),
+                        'exist': True,
                     })
-                train_data_indexes=self.get_train_data_index(len(train_gallery))
-                for train_data_index in train_data_indexes:
-                    index_l, index_r, is_one = train_data_index
-                    train_data.append([train_gallery[index_l],train_gallery[index_r],is_one])
-            return train_data
-        elif self.split == "pretrain":
-            img_names = self.get_train_img_name()
-            train_data = []
-            for index, img_name in enumerate(img_names):  # 枚举每个人，从0开始编号
-                img_path = os.path.join(self.img_prefix, img_name)
-                h, w = self.get_image_dimensions(img_path)
-                boxes = self.generate_random_boxes(h, w, 10)
-                for box in boxes:
-                    box = box.astype(np.int32)
-                    tmp = {
-                        'id': -2,
-                        'img_name': img_name,
-                        'box': box,
-                        'img_path': img_path
-                    }
-                    train_data.append([tmp,tmp,1])
-            return train_data
+                test_data_indexes = self.get_test_data_index(len(test_gallery))
+                for test_data_index in test_data_indexes:
+                    index_l, index_r = test_data_index
+                    test_data.append([test_gallery[index_l], test_gallery[index_r]])
+            return test_data

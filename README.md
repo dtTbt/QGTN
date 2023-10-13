@@ -16,7 +16,7 @@ screen -X -S QGTN quit
 screen -U -S QGTN
 conda activate coat
 python -m torch.distributed.launch \
-    --nproc_per_node=2 \
+    --nproc_per_node=4 \
     --use_env \
     main.py \
     --batch_size 10

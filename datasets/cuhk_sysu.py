@@ -125,13 +125,11 @@ class CUHKSYSU(BaseDataset):
 
     def _load_annotations(self):
         imgs_set, _ = self.load_img()
-        if self.split == "train_full" or self.split == "train_val":
+        if self.split == "train_full":
             train_data = []
             train = loadmat(osp.join(self.root, "annotation/test/train_test/Train.mat"))
             train = train["Train"].squeeze()
             for index, item in enumerate(train):  # 枚举每个人，从0开始编号
-                if self.split == "train_val" and index >= 100:
-                    break
                 pid = index + 1
                 scenes = item[0, 0][2].squeeze()
                 train_gallery = []
@@ -204,3 +202,42 @@ class CUHKSYSU(BaseDataset):
                     index_l, index_r = test_data_index
                     test_data.append([test_gallery[index_l], test_gallery[index_r]])
             return test_data
+        elif self.split == "train_val":
+            train_data = []
+            train = loadmat(osp.join(self.root, "annotation/test/train_test/Train.mat"))
+            train = train["Train"].squeeze()
+            for index, item in enumerate(train):  # 枚举每个人，从0开始编号
+                if index >= 100:  #
+                    break
+                pid = index + 1
+                scenes = item[0, 0][2].squeeze()
+                train_gallery = []
+                train_query = []
+                for img_name, box, _ in scenes:  # 枚举这个人的每一次出现（出现在的图片与图片中的位置）
+                    img_name = str(img_name[0])
+
+                    box = box.squeeze().astype(np.int32)
+                    box[2:] += box[:2]
+                    box = box.reshape(1, 4)
+                    train_query.append({
+                        'img_name': img_name,
+                        'pids': np.array([pid]),  # ndarray (1,)
+                        'boxes': box,  # ndarray (1,4)
+                        'img_path': os.path.join(self.img_prefix, img_name),
+                    })
+
+                    gallery_img = imgs_set[img_name]
+                    boxes = gallery_img['boxes']
+                    pids = gallery_img['pids']
+                    train_gallery.append({
+                        'img_name': img_name,
+                        'pids': pids,  # ndarray (n,)
+                        'boxes': boxes,  # ndarray (n,4)
+                        'img_path': os.path.join(self.img_prefix, img_name),
+                        'exist': True,
+                    })
+                train_data_indexes = self.get_test_data_index(len(train_query))
+                for train_data_index in train_data_indexes:
+                    index_l, index_r = train_data_index
+                    train_data.append([train_query[index_l], train_gallery[index_r]])
+            return train_data

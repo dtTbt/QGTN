@@ -50,8 +50,10 @@ class Transformer(nn.Module):
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
                  num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False,
-                 return_intermediate_dec=False):
+                 return_intermediate_dec=False, args=None):
         super().__init__()
+
+        assert args is not None
 
         encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
@@ -59,7 +61,7 @@ class Transformer(nn.Module):
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
         decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
+                                                dropout, activation, normalize_before,args=args)
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
                                           return_intermediate=return_intermediate_dec,
@@ -76,19 +78,18 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed, query_person, person_pos):
+    def forward(self, src, mask, query_embed, pos_embed, query_person, person_pos, args=None):
         # flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
         src = src.flatten(2).permute(2, 0, 1)  # (h*w,bs,d_model), 图片信息
-        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)  # (h*w,bs,d_model), 位置编码
-        person_pos = person_pos.flatten(2).permute(2, 0, 1)
-        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)  # (n_q,bs,d_model)
+        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)  # (h*w,bs,d_model), gallery图片的位置编码
+        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)  # (n_q,bs,d_model), 即object query
         mask = mask.flatten(1)  # (bs,h*w)
 
         tgt = torch.zeros_like(query_embed)  # (n_query,bs,d_model)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)  # (h*w,bs,d_model)
         hs, references = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                          pos=pos_embed, query_pos=query_embed, query_person=query_person, person_pos=person_pos)
+                          pos=pos_embed, query_pos=query_embed, query_person=query_person, person_pos=person_pos, args=args)
         return hs, references
 
 
@@ -135,34 +136,37 @@ class TransformerDecoder(nn.Module):
                 tgt_key_padding_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None,  # (n_q,bs,d_model)，即object query
                 query_person=None,
-                person_pos=None):
+                person_pos=None,
+                args=None,
+                ):
         output = tgt
 
         intermediate = []
-        reference_points_before_sigmoid = self.ref_point_head(query_pos)    # FFN将 (n_q,bs,256) -> (n_q,bs,2)
-        reference_points = reference_points_before_sigmoid.sigmoid().transpose(0, 1)  # (bs,n_q,2)
+        reference_points_before_sigmoid = self.ref_point_head(query_pos)    # FFN将 (n_q,bs,256) -> (n_q,bs,2)，即根据object query得到参考点
+        reference_points = reference_points_before_sigmoid.sigmoid().transpose(0, 1)  # (bs,n_q,2)，将参考点的值映射到(0,1)区间
 
         for layer_id, layer in enumerate(self.layers):
-            obj_center = reference_points[..., :2].transpose(0, 1)      # 参考点，(n_q,bs,2)
+            obj_center = reference_points.transpose(0, 1)      # 参考点，(n_q,bs,2)
 
             # For the first decoder layer, we do not apply transformation over p_s
             if layer_id == 0:
                 pos_transformation = 1
             else:
-                pos_transformation = self.query_scale(output)  # 根据上一层decoder_layer得输出得到参考点编码变换
+                pos_transformation = self.query_scale(output)  # (n_q,bs,d_model), 根据上一层decoder_layer得输出得到位置编码变换
 
             # get sine embedding for the query vector
             query_sine_embed = gen_sineembed_for_position(obj_center)  # 参考点编码。(n_q,bs,2) -> (n_q,bs,d_model)
             # apply transformation
             query_sine_embed = query_sine_embed * pos_transformation  # 逐元素乘法
+
             output = layer(output, memory, tgt_mask=tgt_mask,
                            memory_mask=memory_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
                            memory_key_padding_mask=memory_key_padding_mask,
                            pos=pos, query_pos=query_pos, query_sine_embed=query_sine_embed,
-                           is_first=(layer_id == 0), query_person=query_person, person_pos=person_pos)
+                           is_first=(layer_id == 0), query_person=query_person, person_pos=person_pos,args=args)
             if self.return_intermediate:
                 intermediate.append(self.norm(output))
 
@@ -241,7 +245,7 @@ class TransformerEncoderLayer(nn.Module):
 class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
+                 activation="relu", normalize_before=False,args=None):
         super().__init__()
         # Decoder Self-Attention
         self.sa_qcontent_proj = nn.Linear(d_model, d_model)
@@ -277,59 +281,88 @@ class TransformerDecoderLayer(nn.Module):
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
 
+        self.args = args
+
+        if self.args.query_self_attn:
+            # Decoder Self-Attention for Query
+            self.self_attn_query = MultiheadAttention(d_model, nhead, dropout=dropout, vdim=d_model)
+            self.query_qcontent_proj = nn.Linear(d_model, d_model)
+            self.query_qpos_proj = nn.Linear(d_model, d_model)
+            self.query_kcontent_proj = nn.Linear(d_model, d_model)
+            self.query_kpos_proj = nn.Linear(d_model, d_model)
+            self.query_v_proj = nn.Linear(d_model, d_model)
+            self.norm4 = nn.LayerNorm(d_model)
+            self.dropout4 = nn.Dropout(dropout)
+        else:
+            self.query_qcontent_proj = nn.Linear(d_model, d_model)
+
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
-    def forward_post(self, tgt, memory,
-                     tgt_mask: Optional[Tensor] = None,
-                     memory_mask: Optional[Tensor] = None,
-                     tgt_key_padding_mask: Optional[Tensor] = None,
-                     memory_key_padding_mask: Optional[Tensor] = None,
-                     pos: Optional[Tensor] = None,
-                     query_pos: Optional[Tensor] = None,
-                     query_sine_embed = None,
+    def forward_post(self, tgt, memory,  # tgt: (n_q,bs,d_model)  memory: (hw,bs,d_model)
+                     tgt_mask: Optional[Tensor] = None,  # None
+                     memory_mask: Optional[Tensor] = None,  # None
+                     tgt_key_padding_mask: Optional[Tensor] = None,  # None
+                     memory_key_padding_mask: Optional[Tensor] = None,  # (bs,h*w)
+                     pos: Optional[Tensor] = None,  # (hw,bs,d_model), 特征图的位置编码
+                     query_pos: Optional[Tensor] = None,  # (n_q,bs,d_model), 即object query
+                     query_sine_embed = None,  # (n_q,bs,d_model)
                      is_first = False,
                      query_person=None,
                      person_pos=None,
+                     args=None,
                      ):
                      
-        # ========== Begin of Self-Attention =============
+        # ========== Self-Attention =============
         # Apply projections here
         # shape: num_queries x batch_size x 256
-        query_person = query_person + person_pos  # (1, bs, d_model)
+        hw = memory.shape[0]  # hw = h*w, 即特征图的像素数
+        n_q = query_pos.shape[0]
 
         q_content = self.sa_qcontent_proj(tgt)  # 维度不变 (n_q,bs,d_model)
         q_pos = self.sa_qpos_proj(query_pos)  # query_pos是随机。维度不变 (n_q,bs,d_model)
+        q = q_content + q_pos
+
         k_content = self.sa_kcontent_proj(tgt)  # 维度不变 (n_q,bs,d_model)
         k_pos = self.sa_kpos_proj(query_pos)  # 维度不变 (n_q,bs,d_model)
-        v = self.sa_v_proj(tgt)  # 维度不变 (n_q,bs,d_model)
-
-        num_queries, bs, n_model = q_content.shape
-        hw, _, _ = k_content.shape
-
-        q = q_content + q_pos
         k = k_content + k_pos
+
+        v = self.sa_v_proj(tgt)  # 维度不变 (n_q,bs,d_model)
 
         tgt2 = self.self_attn(q, k, value=v, attn_mask=tgt_mask,
                               key_padding_mask=tgt_key_padding_mask)[0]
-        # ========== End of Self-Attention =============
-
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
-        # ========== Begin of Cross-Attention =============
-        # Apply projections here
-        # shape: num_queries x batch_size x 256
+        if self.args.query_self_attn:
+            # ========== Self-Attention for Query =============
+            q_content = self.query_qcontent_proj(query_person)  # (n_q,bs,d_model)
+            q_pos = self.query_qpos_proj(person_pos)  # (n_q,bs,d_model)
+            q = q_content + q_pos
+
+            k_content = self.query_kcontent_proj(query_person)  # (n_q,bs,d_model)
+            k_pos = self.query_kpos_proj(person_pos)  # (n_q,bs,d_model)
+            k = k_content + k_pos
+
+            v = self.query_v_proj(query_person)  # (n_q,bs,d_model)
+
+            tgt2 = self.self_attn_query(q, k, value=v)[0]  # (n_q,bs,d_model)
+            query_feat = query_person + self.dropout4(tgt2)  # (n_q,bs,d_model)
+            query_feat = self.norm4(query_feat)  # (n_q,bs,d_model)
+        else:
+            query_feat = query_person + person_pos
+
+        # ========== Cross-Attention =============
         q_content = self.ca_qcontent_proj(tgt)
+        query_qcontent = self.query_qcontent_proj(query_feat)
+        q_content = q_content + query_qcontent
+
         k_content = self.ca_kcontent_proj(memory)
+        k_pos = self.ca_kpos_proj(pos)
+
         v = self.ca_v_proj(memory)
 
-        q_content = q_content + query_person
-
         num_queries, bs, n_model = q_content.shape
-        hw, _, _ = k_content.shape
-
-        k_pos = self.ca_kpos_proj(pos)
 
         # For the first decoder layer, we concatenate the positional embedding predicted from 
         # the object query (the positional embedding) into the original query (key) in DETR.
@@ -341,25 +374,24 @@ class TransformerDecoderLayer(nn.Module):
             q = q_content
             k = k_content
 
-        q = q.view(num_queries, bs, self.nhead, n_model//self.nhead)
-        query_sine_embed = self.ca_qpos_sine_proj(query_sine_embed)
-        query_sine_embed = query_sine_embed.view(num_queries, bs, self.nhead, n_model//self.nhead)
-        q = torch.cat([q, query_sine_embed], dim=3).view(num_queries, bs, n_model * 2)
-        k = k.view(hw, bs, self.nhead, n_model//self.nhead)
-        k_pos = k_pos.view(hw, bs, self.nhead, n_model//self.nhead)
-        k = torch.cat([k, k_pos], dim=3).view(hw, bs, n_model * 2)
+        query_sine_embed = self.ca_qpos_sine_proj(query_sine_embed)  # (n_q,bs,d_model)
+        query_sine_embed = query_sine_embed.view(num_queries, bs, self.nhead, n_model//self.nhead)  # (n_q,bs,n_head,d_head)
+        q = q.view(num_queries, bs, self.nhead, n_model//self.nhead)  # (n_q,bs,n_head,d_head)
+        q = torch.cat([q, query_sine_embed], dim=3).view(num_queries, bs, n_model * 2)  # (n_q,bs,d_model*2)
 
-        tgt2 = self.cross_attn(query=q,
-                                   key=k,
-                                   value=v, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]               
-        # ========== End of Cross-Attention =============
+        k_pos = k_pos.view(hw, bs, self.nhead, n_model // self.nhead)  # (hw,bs,n_head,d_head)
+        k = k.view(hw, bs, self.nhead, n_model//self.nhead)  # (hw,bs,n_head,d_head)
+        k = torch.cat([k, k_pos], dim=3).view(hw, bs, n_model * 2)  # (hw,bs,d_model*2)
 
+        tgt2 = self.cross_attn(query=q,key=k,value=v, attn_mask=memory_mask,key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
+
+        # ========== FFN =============
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
+
         return tgt
 
     def forward_pre(self, tgt, memory,
@@ -396,13 +428,14 @@ class TransformerDecoderLayer(nn.Module):
                 is_first = False,
                 query_person = None,
                 person_pos = None,
+                args=None,
                 ):
         if self.normalize_before:
             raise NotImplementedError
             return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
                                     tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
-                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos, query_sine_embed, is_first, query_person, person_pos)
+                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos, query_sine_embed, is_first, query_person, person_pos, args=args)
 
 
 def _get_clones(module, N):
@@ -418,6 +451,7 @@ def build_transformer(args):
         num_decoder_layers=args.dec_layers,
         normalize_before=args.pre_norm,
         return_intermediate_dec=True,
+        args=args,
     )
 
 

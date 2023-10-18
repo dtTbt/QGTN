@@ -19,6 +19,7 @@ from collections import defaultdict, deque
 import datetime
 import pickle
 from typing import Optional, List
+import util.misc as utils
 
 import torch
 import torch.distributed as dist
@@ -240,11 +241,28 @@ class MetricLogger(object):
                         meters=str(self),
                         time=str(iter_time), data=str(data_time),
                         memory=torch.cuda.max_memory_allocated() / MB))
+                    # 保存输出
+                    if utils.is_main_process():
+                        with open('./log.txt', 'a') as f:
+                            f.write(log_msg.format(
+                                i, len(iterable), eta=eta_string,
+                                meters=str(self),
+                                time=str(iter_time), data=str(data_time),
+                                memory=torch.cuda.max_memory_allocated() / MB))
+                            f.write('\n')
                 else:
                     print(log_msg.format(
                         i, len(iterable), eta=eta_string,
                         meters=str(self),
                         time=str(iter_time), data=str(data_time)))
+                    # 保存输出
+                    if utils.is_main_process():
+                        with open('./log.txt', 'a') as f:
+                            f.write(log_msg.format(
+                                i, len(iterable), eta=eta_string,
+                                meters=str(self),
+                                time=str(iter_time), data=str(data_time)))
+                            f.write('\n')
             i += 1
             end = time.time()
         total_time = time.time() - start_time

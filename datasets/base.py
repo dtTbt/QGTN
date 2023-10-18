@@ -1,6 +1,7 @@
 import torch
 from PIL import Image
 import numpy as np
+import random
 
 
 class BaseDataset:
@@ -28,9 +29,39 @@ class BaseDataset:
 
         return labels, target_boxes, target_pids
 
+    def get_image_dimensions(self, image_path):
+        with Image.open(image_path) as img:
+            width, height = img.size
+            return height, width
+
+    def generate_random_bbox(self, image_h, image_w, bbox_h, bbox_w):
+        """
+        Generate a random bounding box within the image boundaries.
+
+        Parameters:
+        image_h (int): Height of the image.
+        image_w (int): Width of the image.
+        bbox_h (int): Height of the bounding box.
+        bbox_w (int): Width of the bounding box.
+
+        Returns:
+        tuple: Bounding box coordinates in the format (xmin, ymin, xmax, ymax).
+        """
+        # Ensure the bounding box dimensions are within the image dimensions
+        max_x = image_w - bbox_w
+        max_y = image_h - bbox_h
+
+        # Generate random coordinates for the bounding box
+        xmin = random.randint(0, max_x)
+        ymin = random.randint(0, max_y)
+        xmax = xmin + bbox_w
+        ymax = ymin + bbox_h
+
+        return (xmin, ymin, xmax, ymax)
+
     def __getitem__(self, index):
         anno = self.annotations[index]
-        query, gallery = anno
+        query, gallery, mode = anno["query"], anno["gallery"], anno["mode"]
         img_q = Image.open(query["img_path"]).convert("RGB")  # (w,h)
         img_g = Image.open(gallery["img_path"]).convert("RGB")
         box_q = torch.as_tensor(query["boxes"], dtype=torch.float32)
@@ -40,8 +71,24 @@ class BaseDataset:
         labels = torch.as_tensor(labels, dtype=torch.long)
 
         target_pids = torch.as_tensor(target_pids, dtype=torch.long)
-        target_boxes = torch.as_tensor(target_boxes, dtype=torch.float32)
+        target_boxes = torch.as_tensor(target_boxes, dtype=torch.float32)  # 未归一化，整数坐标
         target_labels = torch.full((target_pids.shape[0],), 1, dtype=torch.long)
+
+        if mode > 0:
+            img_h, img_w = self.get_image_dimensions(gallery["img_path"])  # int
+            box_move = target_boxes[0]  # tensor (4,)
+            box_h, box_w = int(box_move[3] - box_move[1]), int(box_move[2] - box_move[0])
+            box_move_to = self.generate_random_bbox(img_h, img_w, box_h, box_w)  # (xmin, ymin, xmax, ymax)
+            # 取得img_g中box_move中的内容
+            box_move_src = img_g.crop(tuple(box_move.numpy()))
+            # 取得img_g中box_move_to中的内容
+            box_move_to_src = img_g.crop(box_move_to)
+            # 将box_move_to_src覆盖img_g中box_move中的位置
+            img_g.paste(box_move_to_src, tuple(box_move.numpy()))
+            # 将box_move_src覆盖img_g中box_move_to中的位置
+            img_g.paste(box_move_src, box_move_to)
+            # 更新target_boxes为移动到的位置
+            target_boxes[0] = torch.as_tensor(box_move_to, dtype=torch.float32)
 
         A = {
             'img': img_q,

@@ -108,6 +108,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         targets_nes = targets_nes.to(device)
 
         query_boxes_list = []
+        target_boxes_list = []
         image_sizes = []
         image_sizes_gallery = []
         for sample, target in zip(samples, targets):
@@ -120,12 +121,19 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             size_gallery = target['img_same_shape'].shape[1:]
             size_gallery = tuple(size_gallery)
             image_sizes_gallery.append(size_gallery)
+            target_boxes_list.append(target['target_boxes_nml'][0].to(device))
+
+        # 获得sample的pid
+        pids = []
+        for sample in samples:
+            pids.append(sample['pids'])
+        pids = torch.stack(pids,dim=0).squeeze()  # (bs,)
 
         if auto_amp:
             with amp.autocast(enabled=enable_amp):
-                outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=auto_amp)
+                outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=auto_amp, args=args, target_boxes_list=target_boxes_list)
         else:
-            outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=auto_amp)
+            outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=auto_amp, args=args, target_boxes_list=target_boxes_list)
 
         assert (outputs['pred_boxes'] >= 0).all()
 
@@ -135,12 +143,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
-        # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
-        loss_dict_reduced_unscaled = {f'{k}_unscaled': v
-                                      for k, v in loss_dict_reduced.items()}
-        loss_dict_reduced_scaled = {k: v * weight_dict[k]
-                                    for k, v in loss_dict_reduced.items() if k in weight_dict}
+        loss_dict_reduced_unscaled = {f'{k}_unscaled': v for k, v in loss_dict_reduced.items()}
+        loss_dict_reduced_scaled = {k: v * weight_dict[k] for k, v in loss_dict_reduced.items() if k in weight_dict}
         losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
 
         loss_value = losses_reduced_scaled.item()
@@ -156,9 +161,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         else:
             losses.backward()
 
-        # for name, param in model.named_parameters():
-        #     if param.grad is None:
-        #         print(name)
+        if args.show_no_grad:
+            for name, param in model.named_parameters():
+                if param.grad is None:
+                    print(name)
+            exit()
 
         if max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)

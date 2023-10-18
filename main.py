@@ -35,10 +35,10 @@ def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=10, type=int)
+    parser.add_argument('--batch_size', default=20, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=15, type=int)
-    parser.add_argument('--lr_drop', default=12, type=int)
+    parser.add_argument('--lr_drop', default=10, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
     parser.add_argument('--num_class', default=3, type=int)
@@ -88,10 +88,12 @@ def get_args_parser():
     # * Loss coefficients
     parser.add_argument('--mask_loss_coef', default=1, type=float)
     parser.add_argument('--dice_loss_coef', default=1, type=float)
-    parser.add_argument('--cls_loss_coef', default=2, type=float)
+    parser.add_argument('--cls_loss_coef', default=3, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
+    # cos_sim loss
+    parser.add_argument('--cos_sim_loss_coef', default=2, type=float)
 
     # dataset parameters
     parser.add_argument('--remove_difficult', action='store_true')
@@ -113,11 +115,26 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://172.0.0.1:55568', help='url used to set up distributed training')
 
-    parser.add_argument('--mode', default='one', type=str, help='full or one')
+    # QGTN parameters
+    parser.add_argument('--mode', default='one', type=str, help='full or one or cos')
+    parser.add_argument('--num_queries_one', default=6, type=int, help='number of queries for one mode')
+    parser.add_argument('--num_queries_full', default=70, type=int, help='number of queries for full mode')
+    parser.add_argument('--use_layer3', default=True, type=bool, help='use layer3 in backbone or not')
+    parser.add_argument('--query_feat_len', default=1, type=int, help='query feature length')
+    parser.add_argument('--query_self_attn', default=False, type=bool, help='query self attention or not')
+    parser.add_argument('--fc', default=True, type=bool, help='only when mode is one, it can be true')
+    parser.add_argument('--fc_p', default=3, type=int, help='fc p')
+    parser.add_argument('--test_reid', default=False, type=bool, help='test reid or not')
 
-    parser.add_argument('--ctn', default='', type=str)
-    parser.add_argument('--eval_pth', default='/QGTN/model_epoch14.pth', type=str)
+    # data enhancement
+    parser.add_argument('--data_enhance', default=False, type=bool, help='data enhancement or not')
+    parser.add_argument('--data_enhance_num', default=3, type=int, help='data enhancement number')
+
+    # Others
+    parser.add_argument('--ctn', default='/QGTN/train_pth_0/model_epoch0.pth', type=str)
+    parser.add_argument('--eval_pth', default='/QGTN/train_pth_0/model_epoch0.pth', type=str)
     parser.add_argument('--model_save_dir', default='./train_pth', type=str)
+    parser.add_argument('--show_no_grad', default=False, type=bool)
 
     return parser
 
@@ -132,6 +149,8 @@ def main(args):
     global dataset_pretrain, sampler_pretrain, batch_sampler_pretrain, data_loader_pretrain
     utils.init_distributed_mode(args)
     print(args)
+    if args.fc:
+        assert args.mode == 'one'
 
     device = torch.device(args.device)
 
@@ -164,9 +183,9 @@ def main(args):
 
     #dataset_train = build_dataset('CUHK-SYSU', '/CUHK-SYSU', make_coco_transforms('train'), "train", )
 
-    dataset_train_full = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=True), "train_full")
-    dataset_val = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "val")
-    dataset_tv = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "train_val")
+    dataset_train_full = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=True), "train_full", args=args)
+    dataset_val = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "val", args=args)
+    dataset_tv = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "train_val", args=args)
 
     if args.distributed:
         sampler_train_full = DistributedSampler(dataset_train_full)
@@ -213,6 +232,7 @@ def main(args):
         shutil.rmtree(args.model_save_dir)
     os.makedirs(args.model_save_dir, exist_ok=True)
 
+    print('Mode: ', args.mode)
     print("Start training...")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):

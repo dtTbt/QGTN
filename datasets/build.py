@@ -50,9 +50,9 @@ def print_statistics(dataset):
     print(f"=> {dataset.name}-{dataset.split} loaded:\n" + create_small_table(statistics))
 
 
-def build_dataset(dataset_name, root, transforms, split, verbose=True):
+def build_dataset(dataset_name, root, transforms, split, verbose=True, args=None):
     if dataset_name == "CUHK-SYSU":
-        dataset = CUHKSYSU(root, transforms, split)
+        dataset = CUHKSYSU(root, transforms, split, args=args)
     elif dataset_name == "PRW":
         dataset = PRW(root, transforms, split)
     else:

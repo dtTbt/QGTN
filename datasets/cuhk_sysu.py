@@ -10,9 +10,10 @@ from .base import BaseDataset
 
 
 class CUHKSYSU(BaseDataset):
-    def __init__(self, root, transforms, split):
+    def __init__(self, root, transforms, split, args=None):
         self.name = "CUHK-SYSU"
         self.img_prefix = osp.join(root, "Image", "SSM")
+        self.args = args
         super(CUHKSYSU, self).__init__(root, transforms, split)
 
     def get_img_name(self):  # 返回需要的图片名
@@ -32,8 +33,8 @@ class CUHKSYSU(BaseDataset):
         index = []
         for i in range(n):
             for j in range(n):
-                # if i == j:
-                #     continue
+                if i == j:
+                    continue
                 index.append([i, j])
         return index
 
@@ -126,6 +127,7 @@ class CUHKSYSU(BaseDataset):
     def _load_annotations(self):
         imgs_set, _ = self.load_img()
         if self.split == "train_full":
+            boxes_num = {'0 people': 0, '1 people': 0, '2 people': 0, 'more than 2': 0}
             train_data = []
             train = loadmat(osp.join(self.root, "annotation/test/train_test/Train.mat"))
             train = train["Train"].squeeze()
@@ -157,10 +159,31 @@ class CUHKSYSU(BaseDataset):
                         'img_path': os.path.join(self.img_prefix, img_name),
                         'exist': True,
                     })
+                    # 查找pids中有几个为pid的
+                    pids_num = np.sum(pids == pid)
+                    if pids_num <= 2:
+                        boxes_num[str(pids_num) + ' people'] += 1
+                    else:
+                        boxes_num['more than 2'] += 1
                 train_data_indexes = self.get_train_data_index(len(scenes))
                 for train_data_index in train_data_indexes:
                     index_l, index_r = train_data_index
-                    train_data.append([train_query[index_l], train_gallery[index_r]])
+                    train_data.append({
+                        'query': train_query[index_l],
+                        'gallery': train_gallery[index_r],
+                        'mode': 0  # 代表使用原图片
+                    })
+                if self.args.data_enhance:
+                    for i in range(self.args.data_enhance_num):
+                        enhance_index = i + 1
+                        for train_data_index in train_data_indexes:
+                            index_l, index_r = train_data_index
+                            train_data.append({
+                                'query': train_query[index_l],
+                                'gallery': train_gallery[index_r],
+                                'mode': enhance_index
+                            })
+            print(boxes_num)
             return train_data
         elif self.split == "val":
             test_data = []
@@ -200,7 +223,11 @@ class CUHKSYSU(BaseDataset):
                 test_data_indexes = self.get_test_data_index(len(test_gallery))
                 for test_data_index in test_data_indexes:
                     index_l, index_r = test_data_index
-                    test_data.append([test_gallery[index_l], test_gallery[index_r]])
+                    test_data.append({
+                        'query': test_gallery[index_l],
+                        'gallery': test_gallery[index_r],
+                        'mode': 0  # 代表使用原图片
+                    })
             return test_data
         elif self.split == "train_val":
             train_data = []
@@ -239,5 +266,9 @@ class CUHKSYSU(BaseDataset):
                 train_data_indexes = self.get_test_data_index(len(train_query))
                 for train_data_index in train_data_indexes:
                     index_l, index_r = train_data_index
-                    train_data.append([train_query[index_l], train_gallery[index_r]])
+                    train_data.append({
+                        'query': train_query[index_l],
+                        'gallery': train_gallery[index_r],
+                        'mode': 0  # 代表使用原图片
+                    })
             return train_data

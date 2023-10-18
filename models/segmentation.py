@@ -195,7 +195,7 @@ def dice_loss(inputs, targets, num_boxes):
     return loss.sum() / num_boxes
 
 
-def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
+def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2, use_bce: bool = False):
     """
     Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
     Args:
@@ -211,8 +211,12 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
     Returns:
         Loss tensor
     """
-    prob = inputs.sigmoid()
-    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    if use_bce:
+        prob = inputs
+        ce_loss = F.binary_cross_entropy(inputs, targets, reduction="none")
+    else:
+        prob = inputs.sigmoid()
+        ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     p_t = prob * targets + (1 - prob) * (1 - targets)
     loss = ce_loss * ((1 - p_t) ** gamma)
 

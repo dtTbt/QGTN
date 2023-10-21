@@ -101,11 +101,15 @@ class BaseDataset:
             'boxes': box_g,
             'pids': torch.as_tensor(gallery['pids'], dtype=torch.long),
             'labels': labels,  # query人处为2，其他行人为1
+            'labels_all_one': torch.full((labels.shape), 1, dtype=torch.long),  # 全为1
             'img_path': gallery['img_path'],
             'exist': gallery['exist'],
             'target_boxes': target_boxes,  # (n,4)
             'target_pids': target_pids,  # (n,)
-            'target_labels': target_labels
+            'target_labels': target_labels,  # (n,)
+            'target_boxes_one': target_boxes[0].unsqueeze(dim=0),  # (1,4)
+            'target_pids_one': target_pids[0].unsqueeze(dim=0),  # (1,)
+            'target_labels_one': target_labels[0].unsqueeze(dim=0),  # (1,)
         }
 
         if self.transforms is not None:

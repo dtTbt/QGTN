@@ -28,6 +28,9 @@ from datasets.build import build_dataset, collate_fn
 from utils.transforms import build_transforms
 from torch.cuda import amp
 
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 import eval_cuhk
 
 
@@ -37,11 +40,11 @@ def get_args_parser():
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
     parser.add_argument('--batch_size', default=20, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=15, type=int)
-    parser.add_argument('--lr_drop', default=10, type=int)
+    parser.add_argument('--epochs', default=20, type=int)
+    parser.add_argument('--lr_drop', default=15, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
-    parser.add_argument('--num_class', default=3, type=int)
+    parser.add_argument('--num_class', default=2, type=int)
 
     # Model parameters
     parser.add_argument('--frozen_weights', type=str, default=None,
@@ -55,10 +58,6 @@ def get_args_parser():
                         help="Type of positional embedding to use on top of the image features")
 
     # * Transformer
-    parser.add_argument('--enc_layers', default=0, type=int,
-                        help="Number of encoding layers in the transformer")
-    parser.add_argument('--dec_layers', default=4, type=int,
-                        help="Number of decoding layers in the transformer")
     parser.add_argument('--dim_feedforward', default=2048, type=int,
                         help="Intermediate size of the feedforward layers in the transformer blocks")
     parser.add_argument('--hidden_dim', default=256, type=int,
@@ -88,9 +87,10 @@ def get_args_parser():
     # * Loss coefficients
     parser.add_argument('--mask_loss_coef', default=1, type=float)
     parser.add_argument('--dice_loss_coef', default=1, type=float)
-    parser.add_argument('--cls_loss_coef', default=3, type=float)
+    parser.add_argument('--cls_loss_coef', default=2, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
-    parser.add_argument('--giou_loss_coef', default=2, type=float)
+    parser.add_argument('--giou_loss_coef', default=3, type=float)
+    parser.add_argument('--tgt_loss_coef', default=2, type=float)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
     # cos_sim loss
     parser.add_argument('--cos_sim_loss_coef', default=2, type=float)
@@ -102,7 +102,7 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
-    parser.add_argument('--seed', default=42, type=int)
+    parser.add_argument('--seed', default=3407, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -116,23 +116,23 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://172.0.0.1:55568', help='url used to set up distributed training')
 
     # QGTN parameters
-    parser.add_argument('--mode', default='one', type=str, help='full or one or cos')
-    parser.add_argument('--num_queries_one', default=6, type=int, help='number of queries for one mode')
-    parser.add_argument('--num_queries_full', default=70, type=int, help='number of queries for full mode')
-    parser.add_argument('--use_layer3', default=True, type=bool, help='use layer3 in backbone or not')
+    parser.add_argument('--enc_layers', default=3, type=int)
+    parser.add_argument('--dec_layers', default=6, type=int)
+    parser.add_argument('--enc_layers_2', default=3, type=int)
+    parser.add_argument('--dec_layers_2', default=3, type=int)
+    parser.add_argument('--num_queries_full', default=75, type=int, help='number of queries for full mode')
+    parser.add_argument('--use_layer3', default=False, type=bool, help='use layer3 in backbone or not')
     parser.add_argument('--query_feat_len', default=1, type=int, help='query feature length')
     parser.add_argument('--query_self_attn', default=False, type=bool, help='query self attention or not')
-    parser.add_argument('--fc', default=True, type=bool, help='only when mode is one, it can be true')
-    parser.add_argument('--fc_p', default=3, type=int, help='fc p')
-    parser.add_argument('--test_reid', default=False, type=bool, help='test reid or not')
+    parser.add_argument('--box_cos_rlt', default=True, type=bool, help='box cos relation or not')
 
     # data enhancement
     parser.add_argument('--data_enhance', default=False, type=bool, help='data enhancement or not')
     parser.add_argument('--data_enhance_num', default=3, type=int, help='data enhancement number')
 
     # Others
-    parser.add_argument('--ctn', default='/QGTN/train_pth_0/model_epoch0.pth', type=str)
-    parser.add_argument('--eval_pth', default='/QGTN/train_pth_0/model_epoch0.pth', type=str)
+    parser.add_argument('--ctn', default='', type=str)
+    parser.add_argument('--eval_pth', default='/QGTN/model_epoch19.pth', type=str)
     parser.add_argument('--model_save_dir', default='./train_pth', type=str)
     parser.add_argument('--show_no_grad', default=False, type=bool)
 
@@ -149,8 +149,6 @@ def main(args):
     global dataset_pretrain, sampler_pretrain, batch_sampler_pretrain, data_loader_pretrain
     utils.init_distributed_mode(args)
     print(args)
-    if args.fc:
-        assert args.mode == 'one'
 
     device = torch.device(args.device)
 
@@ -232,7 +230,6 @@ def main(args):
         shutil.rmtree(args.model_save_dir)
     os.makedirs(args.model_save_dir, exist_ok=True)
 
-    print('Mode: ', args.mode)
     print("Start training...")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):

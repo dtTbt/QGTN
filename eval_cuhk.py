@@ -24,7 +24,7 @@ def draw_boxes(image_path, boxes, output_folder, xyxy, sfx, keep_name, scores=No
     """
     Draw bounding boxes on an image
     :param image_path: path to the image
-    :param boxes: tensor of shape (n, 4) or (4,)
+    :param boxes: tensor of shape (n, 4) or (4,), before normalization
     :param output_folder: folder to save the image with bounding boxes
     :param xyxy: whether the boxes are in xyxy format
     :param sfx: suffix to add to the image name
@@ -112,7 +112,8 @@ def post_process(outputs, targets):
     scores = outputs['pred_logits']  # (bs,n_q,2)
     bs = scores.shape[0]
 
-    scores_target = scores[..., -1]  # (bs,n_q), 取得是query人的概率
+    tgt_scores = outputs['tgt_logits']  # (bs,n_q,2)
+    scores_target = tgt_scores[..., -1]  # (bs,n_q), 取得是query人的概率
     scores_target_softmax = torch.softmax(scores_target, dim=-1)  # (bs,n_q)
     max_score_index = torch.argmax(scores_target_softmax, dim=-1)  # (bs,)
 
@@ -122,12 +123,37 @@ def post_process(outputs, targets):
     boxes_out_all = outputs['pred_boxes']  # (bs,n_q,4)
     scores_out_all = scores_target_softmax  # (bs,n_q)
 
-    if 'cos_sim' in outputs:
-        cos_sim_out = outputs['cos_sim'].squeeze(dim=-1)  # (bs,n_q)
-    else:
-        cos_sim_out = None
+    scores_people_t = outputs['pred_logits']  # (bs,n_q,2)
+    scores_tgt_t = outputs['tgt_logits']  # (bs,n_q,2)
+    bs = scores_people_t.shape[0]
+    boxes_out_all_person = []
+    scores_out_all_person = []
+    boxes_out_tgt = []
+    scores_out_tgt = []
+    for i in range(bs):
+        scores_t_bs = scores_people_t[i]  # (n_q,2)
+        index = torch.where(scores_t_bs[:, 1] > 0.7)[0]  # (n_q,)
+        boxes_out_all_person.append(boxes_out_all[i][index])  # (n_q,4)
+        scores_out_all_person.append(scores_t_bs[:, 1][index])  # (n_q,)
 
-    return boxes_out, scores_out, boxes_out_all, scores_out_all, cos_sim_out
+        scores_tgt_t_bs = scores_tgt_t[i]  # (n_q,2)
+        # index = torch.where(scores_tgt_t_bs[:, 1] > 0.0)[0]  # (n_q,)
+        index = max_score_index[i]
+        boxes_out_tgt.append(boxes_out_all[i][index])  # (n_q,4)
+        scores_out_tgt.append(scores_tgt_t_bs[:, 1][index])  # (n_q,)
+
+    out_dic = {
+        'boxes_out': boxes_out,
+        'scores_out': scores_out,
+        'boxes_out_all': boxes_out_all,
+        'scores_out_all': scores_out_all,
+        'boxes_out_all_person': boxes_out_all_person,
+        'scores_out_all_person': scores_out_all_person,
+        'boxes_out_tgt': boxes_out_tgt,
+        'scores_out_tgt': scores_out_tgt
+    }
+
+    return out_dic
 
 
 def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=False, args=None):
@@ -167,8 +193,15 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
                 image_sizes_gallery.append(size_gallery)
 
             outputs = model(query_nes, gallery_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=False, args=args)
-            boxes_out, scores_out, boxes_out_all, scores_out_all, cos_sim_out = post_process(outputs, gallery)
-            # boxes_out: (bs,4), scores_out: (bs,) boxes_out_all: (bs,n_q,4), scores_out_all: (bs,n_q), cos_sim_out: (bs,n_q)
+            out_dic = post_process(outputs, gallery)
+            boxes_out = out_dic['boxes_out']  # (bs,4)
+            scores_out = out_dic['scores_out']  # (bs,)
+            boxes_out_all = out_dic['boxes_out_all']  # (bs,n_q,4)
+            scores_out_all = out_dic['scores_out_all']  # (bs,n_q)
+            boxes_out_all_person = out_dic['boxes_out_all_person']  # list，bs个元素，每个元素为(n,4)，n为每张图片检测出的行人数
+            scores_out_all_person = out_dic['scores_out_all_person']  # list，bs个元素，每个元素为(n,)
+            boxes_out_tgt = out_dic['boxes_out_tgt']  # list，bs个元素，每个元素为(n,4)，n为每张图片检测出的行人数
+            scores_out_tgt = out_dic['scores_out_tgt']  # list，bs个元素，每个元素为(n,)
 
             for index, ps in enumerate(query):
                 pid = int(ps['pids'])
@@ -196,12 +229,18 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
                         break
 
                 if save and exist_:
-                    draw_boxes(query[index]['img_path'], query[index]['boxes_nml'], output_folder, xyxy=True, sfx=str(pid) + '-' + str(index) + '-query', keep_name = False)
-                    draw_boxes(gallery[index]['img_path'], gallery[index]['target_boxes_nml'], output_folder, xyxy=True, sfx=str(pid) + '-' + str(index) + '-target', keep_name = False)
-                    draw_boxes(gallery[index]['img_path'], boxes_out[index], output_folder, xyxy=False, sfx=str(pid) + '-' + str(index) + '-box', keep_name=False)
-                    draw_boxes(gallery[index]['img_path'], boxes_out_all[index], output_folder, xyxy=False, sfx=str(pid) + '-' + str(index) + '-box-all', keep_name=False, scores=scores_out_all[index])
-                    if cos_sim_out is not None:
-                        draw_boxes(gallery[index]['img_path'], boxes_out_all[index], output_folder, xyxy=False, sfx=str(pid) + '-' + str(index) + '-box-all-cos', keep_name=False, scores=cos_sim_out[index], is_cos_sim=True)
+                    boxes_out_all_person_bs = boxes_out_all_person[index]  # (n,4)
+                    scores_out_all_person_bs = scores_out_all_person[index]  # (n,)
+                    draw_boxes(gallery[index]['img_path'], boxes_out_all_person_bs, output_folder, xyxy=False, sfx=str(pid) + '-' + str(index) + '-box-all', keep_name=False, scores=scores_out_all_person_bs)
+                    boxes_out_tgt_bs = boxes_out_tgt[index]  # (n,4)
+                    scores_out_tgt_bs = scores_out_tgt[index]  # (n,)
+                    draw_boxes(gallery[index]['img_path'], boxes_out_tgt_bs, output_folder, xyxy=False, sfx=str(pid) + '-' + str(index) + '-box-tgt', keep_name=False, scores=scores_out_tgt_bs)
+                    # 画出target
+                    target_boxes_bs = gallery[index]['target_boxes_nml']
+                    draw_boxes(gallery[index]['img_path'], target_boxes_bs, output_folder, xyxy=True, sfx=str(pid) + '-' + str(index) + '-target', keep_name=False)
+                    # 画出query
+                    query_boxes_bs = query[index]['boxes_nml']
+                    draw_boxes(query[index]['img_path'], query_boxes_bs, output_folder, xyxy=True, sfx=str(pid) + '-' + str(index) + '-query', keep_name=False)
 
         find_query_acc = query_num_right / query_num_all
         find_query_acc_inc = query_num_inc_right / query_num_inc_all

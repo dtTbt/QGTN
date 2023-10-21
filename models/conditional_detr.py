@@ -15,6 +15,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 import numpy as np
+import copy
+import os
 
 from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -63,22 +65,19 @@ class ConditionalDETR(nn.Module):
         self.num_classes = num_classes
         self.query_feat_len = args.query_feat_len
         hidden_dim = transformer.d_model
-        if args.mode == 'cos':
-            self.num_queries = args.num_queries_one
-            self.query_embed = nn.Embedding(args.num_queries_one, hidden_dim)
-            self.pool_to_11 = nn.AdaptiveAvgPool2d((1, 1))
-        elif args.mode == 'one':
-            self.num_queries = args.num_queries_one
-            self.query_embed = nn.Embedding(self.num_queries, hidden_dim)
-            self.class_embed = MLP(hidden_dim, hidden_dim, num_classes, 2)
-        elif args.mode == 'full':
-            self.num_queries = args.num_queries_full
-            self.query_embed = nn.Embedding(self.num_queries, hidden_dim)
-            self.class_embed = MLP(hidden_dim, hidden_dim, num_classes, 2)
+
+        self.num_queries = args.num_queries_full
+        self.query_embed = nn.Embedding(self.num_queries, hidden_dim)
+        self.class_embed = MLP(hidden_dim, hidden_dim, num_classes, 2)
+        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.tgt_score_proj = MLP(hidden_dim, hidden_dim, num_classes, 2)
+        self.tgt_logits_proj = nn.Linear(4,2)
 
         self.transformer = transformer
+        self.transformer_2 = nn.Transformer(d_model=hidden_dim, nhead=8, num_encoder_layers=args.enc_layers_2,
+                                            num_decoder_layers=args.dec_layers_2, dim_feedforward=args.dim_feedforward)
+
         self.d_model = hidden_dim
-        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
 
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
@@ -119,9 +118,6 @@ class ConditionalDETR(nn.Module):
         pos_query = pos_query[-1]
         query_feat = self.input_proj(query_feat)  # (bs,256,h,w)
         query_person = self.roi_pool(OrderedDict([["feat", query_feat]]), query_boxes_list, image_sizes)  # (bs,256,ql,ql)
-        if args.mode == 'cos':
-            query_person_reid_feat = self.pool_to_11(query_person)  # (bs,256,1,1)
-            query_person_reid_feat = query_person_reid_feat.flatten(2).permute(0, 2, 1)  # (bs,1,256)
 
         # query的位置编码
         pos_query = self.roi_pool(OrderedDict([["feat", pos_query]]), query_boxes_list, image_sizes)  # (bs,256,ql,ql)
@@ -135,63 +131,41 @@ class ConditionalDETR(nn.Module):
         features, pos = self.backbone(targets)  # gallery
         src, mask = features[-1].decompose()  # src即特征图(bs,c,h,w)。mask(bs,h,w)
         pos = pos[-1]  # 位置编码，(bs,d_model,h,w)
-        src = self.input_proj(src)  # 通道数由2048缩减为256
+        src = self.input_proj(src)  # 通道数由2048缩减为d_model，(bs,d_model,h,w)
 
         dec_in = self.query_embed.weight  # (max_len,d_model)，d_model为256，为embedding的权重，即object queries
 
         assert mask is not None
-        hs, reference = self.transformer(src, mask, dec_in, pos, query_person, pos_query, args=args)
+        hs, reference = self.transformer(src, mask, dec_in, pos, args=args)
         # hs(n_layer,bs,n_q,d_model), reference(bs,n_q,2)
+        src_2 = hs[-1].permute(1, 0, 2)  # (n_q,bs,d_model)
+        query_feat = query_person + pos_query
+        hs_2 = self.transformer_2(query_feat, src_2)  # (n_q,bs,d_model)
+
         n_layer = hs.shape[0]
         hs_box = hs
         hs_score = hs
 
         reference_before_sigmoid = inverse_sigmoid(reference)  # 将sigmoid后的值变回去
         outputs_coord = self.bbox_embed(hs_box)  # (n_layer,bs,n_q,4)
-        reference_before_sigmoid = reference_before_sigmoid.unsqueeze(dim=0).repeat(n_layer,1,1,1)
+        reference_before_sigmoid = reference_before_sigmoid.unsqueeze(dim=0).repeat(n_layer, 1, 1, 1)
         outputs_coord[..., :2] += reference_before_sigmoid  # 给中心点加上初始量（即reference point）
         outputs_coord = outputs_coord.sigmoid()  # 框值缩放到0~1区间, (n_layer,bs,n_q,4)
 
-        if args.test_reid:
-            target_boxes_tensor = torch.stack(target_boxes_list, dim=0)  # (bs,4)
-            target_boxes_tensor = box_decoder(target_boxes_tensor, device)  # (bs,4)
-            outputs_coord[0,:,0,:] = target_boxes_tensor  # 将第一层的第一个预测框替换为gt框
+        outputs_class = self.class_embed(hs_score)  # (n_layer,bs,n_q,2)
 
-        if args.mode == 'cos':
-            # 余弦相似度
-            image_sizes_gallery_single = torch.tensor(image_sizes_gallery[0])  # tensor (2,)
-            outputs_coord_bs = outputs_coord.permute(1, 0, 2, 3).reshape(bs,n_layer*n_q,4)  # (bs,n_layer*n_q,4)
-            boxes_list = [xywhn_to_xyxy(box, image_sizes_gallery_single) for box in outputs_coord_bs]  # bs大小的list，每个元素为tensor (n_layer*n_q,4)，为预测框映射回原图的坐标
-            boxes_person = self.roi_pool(OrderedDict([["feat", src]]), boxes_list, image_sizes_gallery)  # (bs*n_layer*n_q,256,ql,ql)
-            boxes_person = self.pool_to_11(boxes_person)  # (bs*n_layer*n_q,256,1,1)
-            boxes_person = boxes_person.reshape(bs * n_layer, n_q, -1)  # (bs*n_layer,n_q,256)
+        mt = outputs_class[-1]
+        tgt_logits = self.tgt_score_proj(hs_2).permute(1, 0, 2)  # (bs,n_q,2)
+        tgt_logits = torch.cat([mt, tgt_logits], dim=-1)  # (bs,n_q,4)
+        tgt_logits = self.tgt_logits_proj(tgt_logits)  # (bs,n_q,2)
 
-            #boxes_person = hs.permute(1, 0, 2, 3).reshape(bs*n_layer, n_q, -1)  # (bs*n_layer,n_q,256)
-
-            query_person_reid_feat = query_person_reid_feat / torch.norm(query_person_reid_feat, dim=2, keepdim=True)  # (bs,1,256)
-            boxes_person = boxes_person / torch.norm(boxes_person, dim=2, keepdim=True)  # (bs*n_layer,n_q,256)
-            query_person_reid_feat = query_person_reid_feat.unsqueeze(dim=1).repeat(1, n_layer, 1, 1).reshape(n_layer * bs, 1, -1)  # (bs*n_layer,1,256)
-            boxes_with_query = torch.cat([query_person_reid_feat, boxes_person], dim=1)  # (bs*n_layer,n_q+1,256), 第0个为query
-            cos_sim = torch.matmul(boxes_with_query, boxes_with_query.transpose(1, 2))  # (bs*n_layer,n_q+1,n_q+1), 值域为[-1,1]
-
-            cos_sim_query = cos_sim.reshape(bs, n_layer, n_q + 1, n_q + 1).permute(1, 0, 2, 3)[:,:,0,1:].unsqueeze(dim=-1)  # (n_layer,bs,n_q,1)
-            out = {
-                'pred_logits': cos_sim_query[-1],  # (bs,n_q,1)
-                'pred_boxes': outputs_coord[-1],  # (bs,n_q,4)
-            }  # 只取最后一层decoder的结果
-            if self.aux_loss:
-                out['aux_outputs'] = self._set_aux_loss(cos_sim_query, outputs_coord)
-        else:
-            outputs_class = self.class_embed(hs_score)  # (n_layer,bs,n_q,2)
-            out = {
-                'pred_logits': outputs_class[-1],  # (bs,n_q,2)
-                'pred_boxes': outputs_coord[-1],  # (bs,n_q,4)
-            }  # 只取最后一层decoder的结果
-            if self.aux_loss:
-                out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)  # 除最后一个decoder layer的前几个层输出
-                if args.fc:
-                    out['pred_boxes'] = outputs_coord[args.fc_p - 1]
-                    out['aux_outputs_all'] = self._set_aux_loss_all(outputs_class, outputs_coord)  # 除最后一个decoder layer的前几个层输出
+        out = {
+            'pred_logits': outputs_class[-1],  # (bs,n_q,2)
+            'pred_boxes': outputs_coord[-1],  # (bs,n_q,4)
+            'tgt_logits': tgt_logits,  # (bs,n_q,2)
+        }  # 只取最后一层decoder的结果
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)  # 除最后一个decoder layer的前几个层输出
 
         return out
 
@@ -202,6 +176,14 @@ class ConditionalDETR(nn.Module):
         # as a dict having both a Tensor and a list.
         return [{'pred_logits': a, 'pred_boxes': b}
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+
+    @torch.jit.unused
+    def _set_aux_loss_for_cos(self, outputs_coord, cos_sim):
+        # this is a workaround to make torchscript happy, as torchscript
+        # doesn't support dictionary with non-homogeneous values, such
+        # as a dict having both a Tensor and a list.
+        return [{'pred_boxes': b, 'pred_logits': c}
+                for b, c in zip(outputs_coord[:-1], cos_sim[:-1])]
 
     def _set_aux_loss_all(self, outputs_class, outputs_coord):
         # this is a workaround to make torchscript happy, as torchscript
@@ -270,24 +252,27 @@ class SetCriterion(nn.Module):
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
 
-    def loss_labels_for_cos(self, outputs, targets, indices, num_boxes, log=True):
+    def loss_tgt(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
         assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits'].squeeze()  # (bs,n_q)
-        src_logits = src_logits * 0.5 + 0.5  # 将值域[-1,1]变为[0,1]
+        src_logits = outputs['pred_logits']  # (bs,n_q,2)
 
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], 0,
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o  # (bs,n_q)
-        target_classes = target_classes.to(torch.float32)
 
-        loss_ce = sigmoid_focal_loss(src_logits, target_classes, num_boxes, alpha=self.focal_alpha, gamma=2, use_bce=True) * \
-                    src_logits.shape[1]
-        losses = {'loss_ce': loss_ce}
+        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
+                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
+        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+
+        target_classes_onehot = target_classes_onehot[:, :, :-1]
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * \
+                  src_logits.shape[1]
+        losses = {'loss_tgt': loss_ce}
 
         return losses
 
@@ -309,6 +294,7 @@ class SetCriterion(nn.Module):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+           notice that the boxes must in (xc, yc, w, h) format and normalized form [0, 1]
         """
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
@@ -355,49 +341,10 @@ class SetCriterion(nn.Module):
         }
         return losses
 
-    def loss_cos_sim(self, outputs, targets, indices, num_boxes):
-        output_cos_sim = outputs['cos_sim']  # (bs,n_q,1)
-        output_boxes = outputs['pred_boxes']  # (bs,n_q,4)
-        # 取得indices的cos_sim
-        idx = self._get_src_permutation_idx(indices)
-        cos_sim_pos = output_cos_sim[idx]  # (n_pos,1)
-        # 取得除了indices的cos_sim
-        num_queries = output_boxes.shape[1]
-        idx_neg = self._get_src_permutation_idx_neg(indices, num_queries)
-        cos_sim_neg = output_cos_sim[idx_neg]  # (n_neg,1)
-
-        # 计算正样本的cos_sim loss，即使得cos_sim尽可能接近1
-        loss_cos_sim_pos = F.l1_loss(cos_sim_pos, torch.ones_like(cos_sim_pos).to(cos_sim_pos.device))
-        # 计算负样本的cos_sim loss，即使得cos_sim尽可能接近0
-        loss_cos_sim_neg = F.l1_loss(cos_sim_neg, torch.zeros_like(cos_sim_neg).to(cos_sim_neg.device))
-        # 计算总的cos_sim loss
-        loss_cos_sim = loss_cos_sim_pos + loss_cos_sim_neg
-        losses = {'loss_cos_sim': loss_cos_sim}
-
-        return losses
-
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
-
-    def _get_src_permutation_idx_neg(self, indices, num_queries):
-        # 取得除indices外的idx
-        batch_idx = []
-        for i in range(len(indices)):
-            # 长度为num_queries-len(indices[i][0])
-            shape = num_queries - len(indices[i][0])
-            batch_idx.append(torch.full((shape,), i))
-        batch_idx = torch.cat(batch_idx)
-
-        src_idx = []
-        for i in range(len(indices)):
-            # 长度为num_queries-len(indices[i][0])
-            shape = num_queries - len(indices[i][0])
-            # 从0到num_queries-1中去掉indices[i][0]中的值
-            src_idx.append(torch.tensor(list(set(range(num_queries)) - set(int(x) for x in indices[i][0]))))
-        src_idx = torch.cat(src_idx)
         return batch_idx, src_idx
 
     def _get_tgt_permutation_idx(self, indices):
@@ -409,9 +356,8 @@ class SetCriterion(nn.Module):
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'labels': self.loss_labels,
-            'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
-            'masks': self.loss_masks
+            'tgt': self.loss_tgt,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -420,6 +366,7 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels_for_cos,
             'boxes': self.loss_boxes,
+            'tgt': self.loss_tgt,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -432,6 +379,16 @@ class SetCriterion(nn.Module):
         re = [(index.reshape(1).to(device), tensor0) for index in max_index]
         return re
 
+    def box_cos_rlt(self, losses):
+        # 对loss_ce进行动态权重调整
+        mt = 1 / torch.exp(losses['loss_bbox'])  # 值域为[0,1]
+        mt = mt * 1
+        losses['loss_ce'] = losses['loss_ce'] * mt
+        for i in range(self.args.dec_layers - 1):
+            mt = 1 / torch.exp(losses['loss_bbox_' + str(i)])
+            mt = mt * 1
+            losses['loss_ce_' + str(i)] = losses['loss_ce_' + str(i)] * mt
+
 
     def forward(self, outputs, targets, top_matcher=False):
         """ This performs the loss computation.
@@ -440,94 +397,70 @@ class SetCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
-        if self.args.fc:
-            assert self.args.dec_layers > self.args.fc_p
-            outputs_without_aux = {}
-            outputs_without_aux['pred_boxes'] = outputs['aux_outputs_all'][self.args.fc_p - 1]['pred_boxes']
-            outputs_without_aux['pred_logits'] = outputs['aux_outputs_all'][-1]['pred_logits']
-        else:
-            outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        device = outputs['pred_logits'].device
 
-        # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets)
+        outputs_for_tgt = {}
+        targets_for_tgt = []
+        for t in targets:
+            tmp = {}
+            tmp['labels'] = t['target_labels'].to(device)
+            tmp['boxes'] = box_decoder(t['target_boxes_nml'],device)  # 转为(xc,yc,w,h)
+            assert tmp['labels'].shape[0] == tmp['boxes'].shape[0]
+            targets_for_tgt.append(tmp)
+        targets_for_tgt = tuple(targets_for_tgt)
+        assert outputs['pred_logits'].shape == outputs['tgt_logits'].shape
+        outputs_for_tgt['pred_boxes'] = outputs['pred_boxes']
+        outputs_for_tgt['pred_logits'] = outputs['tgt_logits']
+        indices_tgt = self.matcher(outputs_for_tgt, targets_for_tgt)
+
+        outputs_for_people = {}
+        targets_for_people = []
+        for t in targets:
+            tmp = {}
+            tmp['labels'] = t['labels_all_one'].to(device)
+            tmp['boxes'] = box_decoder(t['boxes_nml'],device)
+            assert tmp['labels'].shape[0] == tmp['boxes'].shape[0]
+            targets_for_people.append(tmp)
+        targets_for_people = tuple(targets_for_people)
+        outputs_for_people['pred_boxes'] = outputs['pred_boxes']
+        outputs_for_people['pred_logits'] = outputs['pred_logits']
+        indices = self.matcher(outputs_for_people, targets_for_people)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
-        num_boxes = sum(len(t["labels"]) for t in targets)
+        num_boxes = sum(len(t["labels"]) for t in targets_for_people)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
 
+        num_boxes_tgt = sum(len(t["labels"]) for t in targets_for_tgt)
+        num_boxes_tgt = torch.as_tensor([num_boxes_tgt], dtype=torch.float, device=next(iter(outputs.values())).device)
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_boxes_tgt)
+        num_boxes_tgt = torch.clamp(num_boxes_tgt / get_world_size(), min=1).item()
+
         # Compute all the requested losses
         losses = {}
 
-        if self.args.mode == 'cos':
-            for loss in self.losses:
-                if loss == 'masks' or loss == 'cardinality':
-                    continue
-                losses.update(self.get_loss_for_cos(loss, outputs, targets, indices, num_boxes))
-            if 'aux_outputs' in outputs:
-                for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                    indices = self.matcher(aux_outputs, targets)
-                    for loss in self.losses:
-                        if loss == 'masks' or loss == 'cardinality':
-                            continue
-                        kwargs = {}
-                        if loss == 'labels':
-                            # Logging is enabled only for the last layer
-                            kwargs = {'log': False}
-                        l_dict = self.get_loss_for_cos(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
-                        l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
-                        losses.update(l_dict)
+        losses.update(self.get_loss('tgt', outputs_for_tgt, targets_for_tgt, indices_tgt, num_boxes_tgt))
 
-            return losses
-
-        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
-        if self.args.fc:
-            assert 'aux_outputs_all' in outputs
-            for i, aux_outputs in enumerate(outputs['aux_outputs_all']):
-                indices = self.matcher(aux_outputs, targets)
+        for loss in self.losses:
+            if loss == 'masks' or loss == 'cardinality' or loss == 'tgt':
+                continue
+            losses.update(self.get_loss(loss, outputs_for_people, targets_for_people, indices, num_boxes))
+        if 'aux_outputs' in outputs:
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                indices = self.matcher(aux_outputs, targets_for_people)
                 for loss in self.losses:
-                    # 对于前4层，不计算label loss
-                    if i + 1 <= self.args.fc_p and loss == 'labels':
-                        continue
-                    # 对于后2层，不计算box loss
-                    if i + 1 > self.args.fc_p and loss == 'boxes':
-                        continue
-                    if loss == 'masks':
+                    if loss == 'masks' or loss == 'cardinality' or loss == 'tgt':
                         continue
                     kwargs = {}
                     if loss == 'labels':
                         # Logging is enabled only for the last layer
                         kwargs = {'log': False}
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
+                    l_dict = self.get_loss(loss, aux_outputs, targets_for_people, indices, num_boxes, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
-            losses['loss_bbox'] = losses['loss_bbox_' + str(self.args.fc_p - 1)]
-            losses['loss_giou'] = losses['loss_giou_' + str(self.args.fc_p - 1)]
-            losses['loss_ce'] = losses['loss_ce_' + str(self.args.dec_layers - 1)]
-            losses['cardinality_error'] = losses['cardinality_error_' + str(self.args.dec_layers - 1)]
-
-            losses.pop('loss_bbox_' + str(self.args.fc_p - 1))
-            losses.pop('loss_giou_' + str(self.args.fc_p - 1))
-            losses.pop('loss_ce_' + str(self.args.dec_layers - 1))
-            losses.pop('cardinality_error_' + str(self.args.dec_layers - 1))
-        else:
-            for loss in self.losses:
-                losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
-            if 'aux_outputs' in outputs:
-                for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                    indices = self.matcher(aux_outputs, targets)
-                    for loss in self.losses:
-                        if loss == 'masks':
-                            continue
-                        kwargs = {}
-                        if loss == 'labels':
-                            # Logging is enabled only for the last layer
-                            kwargs = {'log': False}
-                        l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
-                        l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
-                        losses.update(l_dict)
 
         return losses
 
@@ -591,10 +524,7 @@ def build(args):
     # you should pass `num_classes` to be 2 (max_obj_id + 1).
     # For more details on this, check the following discussion
     # https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
-    if args.mode == 'full':
-        num_classes = args.num_class
-    else:
-        num_classes = args.num_class - 1
+    num_classes = args.num_class
 
     device = torch.device(args.device)
 
@@ -614,6 +544,7 @@ def build(args):
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict['loss_tgt'] = args.tgt_loss_coef
 
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
@@ -625,7 +556,7 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'cardinality']
+    losses = ['labels', 'boxes', 'cardinality', 'tgt']
     if args.masks:
         losses += ["masks"]
     criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
@@ -639,3 +570,33 @@ def build(args):
             postprocessors["panoptic"] = PostProcessPanoptic(is_thing_map, threshold=0.85)
 
     return model, criterion, postprocessors
+
+# if args.mode == 'cos':
+#     if args.test_reid:
+#         target_boxes_tensor = torch.stack(target_boxes_list, dim=0)  # (bs,4)
+#         target_boxes_tensor = box_decoder(target_boxes_tensor, device)  # (bs,4)
+#         outputs_coord[0,:,0,:] = target_boxes_tensor  # 将第一层的第一个预测框替换为gt框
+#     # 余弦相似度
+#     image_sizes_gallery_single = torch.tensor(image_sizes_gallery[0])  # tensor (2,)
+#     outputs_coord_bs = outputs_coord.permute(1, 0, 2, 3).reshape(bs,n_layer*n_q,4)  # (bs,n_layer*n_q,4)
+#     boxes_list = [xywhn_to_xyxy(box, image_sizes_gallery_single) for box in outputs_coord_bs]  # bs大小的list，每个元素为tensor (n_layer*n_q,4)，为预测框映射回原图的坐标
+#     boxes_person = self.roi_pool(OrderedDict([["feat", src]]), boxes_list, image_sizes_gallery)  # (bs*n_layer*n_q,256,ql,ql)
+#     boxes_person = self.pool_to_11(boxes_person)  # (bs*n_layer*n_q,256,1,1)
+#     boxes_person = boxes_person.reshape(bs * n_layer, n_q, -1)  # (bs*n_layer,n_q,256)
+#
+#     #boxes_person = hs.permute(1, 0, 2, 3).reshape(bs*n_layer, n_q, -1)  # (bs*n_layer,n_q,256)
+#
+#     query_person_reid_feat = query_person_reid_feat / torch.norm(query_person_reid_feat, dim=2, keepdim=True)  # (bs,1,256)
+#     boxes_person = boxes_person / torch.norm(boxes_person, dim=2, keepdim=True)  # (bs*n_layer,n_q,256)
+#     query_person_reid_feat = query_person_reid_feat.unsqueeze(dim=1).repeat(1, n_layer, 1, 1).reshape(n_layer * bs, 1, -1)  # (bs*n_layer,1,256)
+#     boxes_with_query = torch.cat([query_person_reid_feat, boxes_person], dim=1)  # (bs*n_layer,n_q+1,256), 第0个为query
+#     cos_sim = torch.matmul(boxes_with_query, boxes_with_query.transpose(1, 2))  # (bs*n_layer,n_q+1,n_q+1), 值域为[-1,1]
+#
+#     cos_sim_query = cos_sim.reshape(bs, n_layer, n_q + 1, n_q + 1).permute(1, 0, 2, 3)[:,:,0,1:].unsqueeze(dim=-1)  # (n_layer,bs,n_q,1)
+#     out = {
+#         'pred_boxes': outputs_coord[-1],  # (bs,n_q,4)
+#         'pred_logits': cos_sim_query[-1]  # (bs,n_q,1)
+#     }  # 只取最后一层decoder的结果
+#     if self.aux_loss:
+#         out['aux_outputs'] = self._set_aux_loss_for_cos(outputs_coord, cos_sim_query)  # 除最后一个decoder layer的前几个层输出
+#     return out

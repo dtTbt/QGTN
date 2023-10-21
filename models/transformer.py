@@ -50,7 +50,7 @@ class Transformer(nn.Module):
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
                  num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False,
-                 return_intermediate_dec=False, args=None):
+                 return_intermediate_dec=False, args=None, query_feat_add=False):
         super().__init__()
 
         assert args is not None
@@ -61,7 +61,7 @@ class Transformer(nn.Module):
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
         decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before,args=args)
+                                                dropout, activation, normalize_before,args=args, query_feat_add=query_feat_add)
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
                                           return_intermediate=return_intermediate_dec,
@@ -72,13 +72,17 @@ class Transformer(nn.Module):
         self.d_model = d_model
         self.nhead = nhead
         self.dec_layers = num_decoder_layers
+        self.query_feat_add = query_feat_add
 
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed, query_person, person_pos, args=None):
+    def forward(self, src, mask, query_embed, pos_embed, query_person=None, person_pos=None, args=None):
+        if self.query_feat_add:
+            assert query_person is not None, 'when query_feat_add is True, query_person must be not None'
+            assert person_pos is not None, 'when query_feat_add is True, person_pos must be not None'
         # flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
         src = src.flatten(2).permute(2, 0, 1)  # (h*w,bs,d_model), 图片信息
@@ -245,7 +249,7 @@ class TransformerEncoderLayer(nn.Module):
 class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False,args=None):
+                 activation="relu", normalize_before=False,args=None, query_feat_add=False):
         super().__init__()
         # Decoder Self-Attention
         self.sa_qcontent_proj = nn.Linear(d_model, d_model)
@@ -283,18 +287,20 @@ class TransformerDecoderLayer(nn.Module):
 
         self.args = args
 
-        if self.args.query_self_attn:
-            # Decoder Self-Attention for Query
-            self.self_attn_query = MultiheadAttention(d_model, nhead, dropout=dropout, vdim=d_model)
-            self.query_qcontent_proj = nn.Linear(d_model, d_model)
-            self.query_qpos_proj = nn.Linear(d_model, d_model)
-            self.query_kcontent_proj = nn.Linear(d_model, d_model)
-            self.query_kpos_proj = nn.Linear(d_model, d_model)
-            self.query_v_proj = nn.Linear(d_model, d_model)
-            self.norm4 = nn.LayerNorm(d_model)
-            self.dropout4 = nn.Dropout(dropout)
-        else:
-            self.query_qcontent_proj = nn.Linear(d_model, d_model)
+        self.query_feat_add = query_feat_add
+        if self.query_feat_add:
+            if self.args.query_self_attn:
+                # Decoder Self-Attention for Query
+                self.self_attn_query = MultiheadAttention(d_model, nhead, dropout=dropout, vdim=d_model)
+                self.query_qcontent_proj = nn.Linear(d_model, d_model)
+                self.query_qpos_proj = nn.Linear(d_model, d_model)
+                self.query_kcontent_proj = nn.Linear(d_model, d_model)
+                self.query_kpos_proj = nn.Linear(d_model, d_model)
+                self.query_v_proj = nn.Linear(d_model, d_model)
+                self.norm4 = nn.LayerNorm(d_model)
+                self.dropout4 = nn.Dropout(dropout)
+            else:
+                self.query_proj = nn.Linear(d_model, d_model)
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
@@ -312,10 +318,30 @@ class TransformerDecoderLayer(nn.Module):
                      person_pos=None,
                      args=None,
                      ):
-                     
+        # ========== Query Feature =============
+        if self.query_feat_add:
+            if self.args.query_self_attn:
+                # ========== Self-Attention for Query =============
+                q_content = self.query_qcontent_proj(query_person)  # (n_q,bs,d_model)
+                q_pos = self.query_qpos_proj(person_pos)  # (n_q,bs,d_model)
+                q = q_content + q_pos
+
+                k_content = self.query_kcontent_proj(query_person)  # (n_q,bs,d_model)
+                k_pos = self.query_kpos_proj(person_pos)  # (n_q,bs,d_model)
+                k = k_content + k_pos
+
+                v = self.query_v_proj(query_person)  # (n_q,bs,d_model)
+
+                tgt2 = self.self_attn_query(q, k, value=v)[0]  # (n_q,bs,d_model)
+                query_feat = query_person + self.dropout4(tgt2)  # (n_q,bs,d_model)
+                query_feat = self.norm4(query_feat)  # (n_q,bs,d_model)
+            else:
+                query_feat = self.query_proj(query_person) + person_pos
+
         # ========== Self-Attention =============
         # Apply projections here
         # shape: num_queries x batch_size x 256
+
         hw = memory.shape[0]  # hw = h*w, 即特征图的像素数
         n_q = query_pos.shape[0]
 
@@ -334,28 +360,11 @@ class TransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
-        if self.args.query_self_attn:
-            # ========== Self-Attention for Query =============
-            q_content = self.query_qcontent_proj(query_person)  # (n_q,bs,d_model)
-            q_pos = self.query_qpos_proj(person_pos)  # (n_q,bs,d_model)
-            q = q_content + q_pos
-
-            k_content = self.query_kcontent_proj(query_person)  # (n_q,bs,d_model)
-            k_pos = self.query_kpos_proj(person_pos)  # (n_q,bs,d_model)
-            k = k_content + k_pos
-
-            v = self.query_v_proj(query_person)  # (n_q,bs,d_model)
-
-            tgt2 = self.self_attn_query(q, k, value=v)[0]  # (n_q,bs,d_model)
-            query_feat = query_person + self.dropout4(tgt2)  # (n_q,bs,d_model)
-            query_feat = self.norm4(query_feat)  # (n_q,bs,d_model)
-        else:
-            query_feat = query_person + person_pos
-
         # ========== Cross-Attention =============
         q_content = self.ca_qcontent_proj(tgt)
-        query_qcontent = self.query_qcontent_proj(query_feat)
-        q_content = q_content + query_qcontent
+
+        if self.query_feat_add:
+            q_content = q_content + query_feat
 
         k_content = self.ca_kcontent_proj(memory)
         k_pos = self.ca_kpos_proj(pos)
@@ -442,7 +451,7 @@ def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
 
-def build_transformer(args):
+def build_transformer(args, query_feat_add=False):
     return Transformer(
         d_model=args.hidden_dim,
         dropout=args.dropout,
@@ -452,6 +461,20 @@ def build_transformer(args):
         normalize_before=args.pre_norm,
         return_intermediate_dec=True,
         args=args,
+        query_feat_add=query_feat_add
+    )
+
+def build_transformer_2(args, query_feat_add=False):
+    return Transformer(
+        d_model=args.hidden_dim,
+        dropout=args.dropout,
+        dim_feedforward=args.dim_feedforward,
+        num_encoder_layers=args.enc_layers_2,
+        num_decoder_layers=args.dec_layers_2,
+        normalize_before=args.pre_norm,
+        return_intermediate_dec=True,
+        args=args,
+        query_feat_add=query_feat_add
     )
 
 

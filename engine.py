@@ -10,6 +10,8 @@
 """
 Train and eval functions used in main.py
 """
+import copy
+
 import math
 import os
 import sys
@@ -75,14 +77,6 @@ def get_loss(outputs, targets, device):
         'boxes': box_loss
     }
 
-def target_trs(targets,device,mode):
-    for t in targets:
-        if mode == 'full':
-            t['labels'] = t['labels'].to(device)
-            t['boxes'] = box_decoder(t['boxes_nml'],device)
-        else:
-            t['labels'] = t['target_labels'].to(device)
-            t['boxes'] = box_decoder(t['target_boxes_nml'],device)
 
 def get_reid_loss(a,b):
     bs, n_q = a.shape
@@ -137,7 +131,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         assert (outputs['pred_boxes'] >= 0).all()
 
-        target_trs(targets, device, mode = args.mode)
         loss_dict = criterion(outputs, targets, top_matcher=False)
         weight_dict = criterion.weight_dict
 
@@ -180,6 +173,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             'ce': loss_dict_reduced_scaled['loss_ce'],
             'box': loss_dict_reduced_scaled['loss_bbox'],
             'giou': loss_dict_reduced_scaled['loss_giou'],
+            'tgt': loss_dict_reduced_scaled['loss_tgt'],
         }
         metric_logger.update(lr=optimizer.param_groups[0]["lr"], loss=loss_value, **print_loss)
     # gather the stats from all processes

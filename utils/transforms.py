@@ -37,10 +37,12 @@ class ToTensor:
         image['boxes_nml'] = image['boxes'] / (torch.flip(torch.tensor(image['img'].shape[1:]),dims=[0])).repeat(2).reshape(1,4)
         target['boxes_nml'] = target['boxes'] / (torch.flip(torch.tensor(target['img'].shape[1:]), dims=[0])).repeat(2).reshape(1,4)
         target['target_boxes_nml'] = target['target_boxes'] / (torch.flip(torch.tensor(target['img'].shape[1:]), dims=[0])).repeat(2).reshape(1, 4)
+        target['target_boxes_one_nml'] = target['target_boxes_one'] / (torch.flip(torch.tensor(target['img'].shape[1:]), dims=[0])).repeat(2).reshape(1, 4)
 
         assert (image['boxes_nml'][:, 2:] >= image['boxes_nml'][:, :2]).all()
         assert (target['boxes_nml'][:, 2:] >= target['boxes_nml'][:, :2]).all()
         assert (target['target_boxes_nml'][:, 2:] >= target['target_boxes_nml'][:, :2]).all()
+        assert (target['target_boxes_one_nml'][:, 2:] >= target['target_boxes_one_nml'][:, :2]).all()
 
         return image, target
 

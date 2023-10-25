@@ -73,13 +73,14 @@ class Transformer(nn.Module):
         self.nhead = nhead
         self.dec_layers = num_decoder_layers
         self.query_feat_add = query_feat_add
+        self.args = args
 
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed, query_person=None, person_pos=None, args=None):
+    def forward(self, src, mask, query_embed, pos_embed, query_person=None, person_pos=None):
         if self.query_feat_add:
             assert query_person is not None, 'when query_feat_add is True, query_person must be not None'
             assert person_pos is not None, 'when query_feat_add is True, person_pos must be not None'
@@ -93,7 +94,7 @@ class Transformer(nn.Module):
         tgt = torch.zeros_like(query_embed)  # (n_query,bs,d_model)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)  # (h*w,bs,d_model)
         hs, references = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                          pos=pos_embed, query_pos=query_embed, query_person=query_person, person_pos=person_pos, args=args)
+                          pos=pos_embed, query_pos=query_embed, query_person=query_person, person_pos=person_pos, args=self.args)
         return hs, references
 
 
@@ -336,6 +337,9 @@ class TransformerDecoderLayer(nn.Module):
                 query_feat = query_person + self.dropout4(tgt2)  # (n_q,bs,d_model)
                 query_feat = self.norm4(query_feat)  # (n_q,bs,d_model)
             else:
+                # query_person的shape[0]必须为person_pos的shape[0]的整数倍
+                assert query_person.shape[0] % person_pos.shape[0] == 0
+                person_pos = person_pos.repeat(query_person.shape[0] // person_pos.shape[0], 1, 1)
                 query_feat = self.query_proj(query_person) + person_pos
 
         # ========== Self-Attention =============

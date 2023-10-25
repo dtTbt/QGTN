@@ -71,9 +71,17 @@ def collate_fn(batch):
     tmp = nested_tensor_from_tensor_list(img_list)
     index = 0
     for bt in batch:
-        for t in bt:
+        for i, t in enumerate(bt):
             t['img_same_shape'] = tmp.tensors[index]
             t['mask'] = tmp.mask[index]
+            h_same, w_same = t['img_same_shape'].shape[-2:]
+            to_div = torch.tensor([w_same, h_same, w_same, h_same]).reshape(1, 4)
+            if i == 0:  # query
+                t['boxes_nml_s'] = t['boxes'] / to_div
+            else:  # gallery
+                t['boxes_nml_s'] = t['boxes'] / to_div
+                t['target_boxes_nml_s'] = t['target_boxes'] / to_div
+                t['target_boxes_one_nml_s'] = t['target_boxes_one'] / to_div
             index += 1
     return tuple(zip(*batch))
 

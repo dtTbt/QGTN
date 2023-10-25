@@ -20,7 +20,7 @@ from typing import Iterable
 import numpy
 import torch
 from torch.cuda import amp
-
+from eval_cuhk import draw_points
 import util.misc as utils
 
 from util.misc import NestedTensor
@@ -84,6 +84,7 @@ def get_reid_loss(a,b):
     re = re / (bs * n_q)
     return re
 
+import shutil
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -95,7 +96,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
+    output_folder = './look_train'
+    if os.path.exists(output_folder):
+        shutil.rmtree(output_folder)
+    os.makedirs(output_folder)
+    train_index = 0
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+        train_index += 1
         samples_nes = trs_to_nestensor(samples)
         targets_nes = trs_to_nestensor(targets)
         samples_nes = samples_nes.to(device)
@@ -103,6 +110,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         query_boxes_list = []
         target_boxes_list = []
+        target_boxes_nml_s_list = []
         image_sizes = []
         image_sizes_gallery = []
         for sample, target in zip(samples, targets):
@@ -115,7 +123,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             size_gallery = target['img_same_shape'].shape[1:]
             size_gallery = tuple(size_gallery)
             image_sizes_gallery.append(size_gallery)
-            target_boxes_list.append(target['target_boxes_nml'][0].to(device))
+            target_boxes_list.append(target['target_boxes_one'].to(device))
+            target_boxes_nml_s_list.append(target['target_boxes_one_nml_s'].to(device))
 
         # 获得sample的pid
         pids = []
@@ -123,13 +132,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             pids.append(sample['pids'])
         pids = torch.stack(pids,dim=0).squeeze()  # (bs,)
 
-        if auto_amp:
-            with amp.autocast(enabled=enable_amp):
-                outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=auto_amp, args=args, target_boxes_list=target_boxes_list)
-        else:
-            outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=auto_amp, args=args, target_boxes_list=target_boxes_list)
+        outputs = model(samples_nes, targets_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=auto_amp, args=args,
+                        target_boxes_list=target_boxes_list,
+                        target_boxes_nml_s_list=target_boxes_nml_s_list,
+        )
 
-        assert (outputs['pred_boxes'] >= 0).all()
 
         loss_dict = criterion(outputs, targets, top_matcher=False)
         weight_dict = criterion.weight_dict
@@ -170,10 +177,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             optimizer.step()
 
         print_loss = {
-            'ce': loss_dict_reduced_scaled['loss_ce'],
-            'box': loss_dict_reduced_scaled['loss_bbox'],
-            'giou': loss_dict_reduced_scaled['loss_giou'],
-            'tgt': loss_dict_reduced_scaled['loss_tgt'],
+            'pts': loss_dict_reduced['loss_points'],
+            'box': loss_dict_reduced['loss_boxes'],
         }
         metric_logger.update(lr=optimizer.param_groups[0]["lr"], loss=loss_value, **print_loss)
     # gather the stats from all processes

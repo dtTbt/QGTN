@@ -33,6 +33,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 import eval_cuhk
 
+torch.autograd.set_detect_anomaly(True)
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
@@ -88,9 +89,9 @@ def get_args_parser():
     parser.add_argument('--mask_loss_coef', default=1, type=float)
     parser.add_argument('--dice_loss_coef', default=1, type=float)
     parser.add_argument('--cls_loss_coef', default=2, type=float)
-    parser.add_argument('--bbox_loss_coef', default=5, type=float)
+    parser.add_argument('--bbox_loss_coef', default=2, type=float)
     parser.add_argument('--giou_loss_coef', default=3, type=float)
-    parser.add_argument('--tgt_loss_coef', default=2, type=float)
+    parser.add_argument('--pts_loss_coef', default=5, type=float)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
     # cos_sim loss
     parser.add_argument('--cos_sim_loss_coef', default=2, type=float)
@@ -116,11 +117,9 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://172.0.0.1:55568', help='url used to set up distributed training')
 
     # QGTN parameters
-    parser.add_argument('--enc_layers', default=3, type=int)
-    parser.add_argument('--dec_layers', default=6, type=int)
-    parser.add_argument('--enc_layers_2', default=3, type=int)
-    parser.add_argument('--dec_layers_2', default=3, type=int)
-    parser.add_argument('--num_queries_full', default=75, type=int, help='number of queries for full mode')
+    parser.add_argument('--enc_layers', default=0, type=int)
+    parser.add_argument('--dec_layers', default=4, type=int)
+    parser.add_argument('--num_queries_full', default=60, type=int, help='number of queries for full mode')
     parser.add_argument('--use_layer3', default=False, type=bool, help='use layer3 in backbone or not')
     parser.add_argument('--query_feat_len', default=1, type=int, help='query feature length')
     parser.add_argument('--query_self_attn', default=False, type=bool, help='query self attention or not')
@@ -132,9 +131,10 @@ def get_args_parser():
 
     # Others
     parser.add_argument('--ctn', default='', type=str)
-    parser.add_argument('--eval_pth', default='/QGTN/model_epoch19.pth', type=str)
+    parser.add_argument('--eval_pth', default='/QGTN/model_epoch2.pth', type=str)
     parser.add_argument('--model_save_dir', default='./train_pth', type=str)
     parser.add_argument('--show_no_grad', default=False, type=bool)
+    parser.add_argument('--train_show', default=True, type=bool)
 
     return parser
 

@@ -19,6 +19,7 @@ import copy
 import os
 
 from util import box_ops
+from eval_cuhk import draw_points
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size, interpolate,
                        is_dist_avail_and_initialized, inverse_sigmoid)
@@ -64,18 +65,22 @@ class ConditionalDETR(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.query_feat_len = args.query_feat_len
+        self.query_feat_num = pow(self.query_feat_len, 2)
         hidden_dim = transformer.d_model
 
         self.num_queries = args.num_queries_full
-        self.query_embed = nn.Embedding(self.num_queries, hidden_dim)
-        self.class_embed = MLP(hidden_dim, hidden_dim, num_classes, 2)
-        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.tgt_score_proj = MLP(hidden_dim, hidden_dim, num_classes, 2)
-        self.tgt_logits_proj = nn.Linear(4,2)
+        self.query_feat_pos = nn.Embedding(self.query_feat_num, hidden_dim)
+        self.score_embed = nn.Linear(hidden_dim, 1)
+        self.bbox_embed = nn.Linear(hidden_dim, 4)
 
-        self.transformer = transformer
-        self.transformer_2 = nn.Transformer(d_model=hidden_dim, nhead=8, num_encoder_layers=args.enc_layers_2,
-                                            num_decoder_layers=args.dec_layers_2, dim_feedforward=args.dim_feedforward)
+        #self.transformer = transformer
+        self.transformer = nn.Transformer(
+            d_model=hidden_dim,
+            nhead=8,
+            num_encoder_layers=1,
+            num_decoder_layers=6,
+            dim_feedforward=2048,
+        )
 
         self.d_model = hidden_dim
 
@@ -87,10 +92,12 @@ class ConditionalDETR(nn.Module):
                                            output_size=(self.query_feat_len, self.query_feat_len),
                                            sampling_ratio=2
         )
-        # 大小需要匹配num_queries
-        self.pos_pool = nn.AdaptiveAvgPool2d((4, 4))
+        self.max_pool = nn.AdaptiveAvgPool2d((1,1))
 
-    def forward(self, samples: NestedTensor, targets, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=False, args=None, target_boxes_list=None):
+    def forward(self, samples: NestedTensor, targets, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=False, args=None,
+                target_boxes_list=None,
+                target_boxes_nml_s_list=None,
+    ):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -113,69 +120,45 @@ class ConditionalDETR(nn.Module):
         d_model = self.d_model
         device = samples.tensors.device
 
-        query, pos_query = self.backbone(samples)  # query
-        query_feat, _ = query[-1].decompose()
-        pos_query = pos_query[-1]
-        query_feat = self.input_proj(query_feat)  # (bs,256,h,w)
-        query_person = self.roi_pool(OrderedDict([["feat", query_feat]]), query_boxes_list, image_sizes)  # (bs,256,ql,ql)
-
-        # query的位置编码
-        pos_query = self.roi_pool(OrderedDict([["feat", pos_query]]), query_boxes_list, image_sizes)  # (bs,256,ql,ql)
-        #pos_query = pos_query[:, :, 0, 0].reshape(bs, d_model, 1, 1)  # (bs,256,1,1)
-        #pos_query = torch.zeros(bs,d_model,1,1).to(pos_query.device)
-        #pos_query = self.pos_pool(pos)  # (bs,d_model,4,4)
-
-        query_person = query_person.flatten(2).permute(2, 0, 1)  # (ql*ql,bs,d_model)
-        pos_query = pos_query.flatten(2).permute(2, 0, 1)  # (ql*ql,bs,d_model)
+        # query人的特征与位置编码
+        query, _ = self.backbone(samples)
+        query_img_feat, _ = query[-1].decompose()
+        query_img_feat = self.input_proj(query_img_feat)  # (bs,256,h,w)。缩减通道数为d_model
+        query_feat = self.roi_pool(OrderedDict([["feat", query_img_feat]]), query_boxes_list, image_sizes)  # (bs,256,ql,ql)
+        query_pos = self.query_feat_pos.weight  # (ql*ql,d_model)
+        query_feat = query_feat.flatten(2).permute(2, 0, 1)  # (ql*ql,bs,d_model)
+        query_pos = query_pos.unsqueeze(dim=1).repeat(1, bs, 1)  # (ql*ql,bs,d_model)
+        query_feat_with_pos = query_feat + query_pos  # (ql*ql,bs,d_model)
 
         features, pos = self.backbone(targets)  # gallery
-        src, mask = features[-1].decompose()  # src即特征图(bs,c,h,w)。mask(bs,h,w)
+        gallery_feat, mask = features[-1].decompose()  # src即特征图(bs,c,h,w)。mask(bs,h,w)
+        feat_h, feat_w = gallery_feat.shape[-2:]
         pos = pos[-1]  # 位置编码，(bs,d_model,h,w)
-        src = self.input_proj(src)  # 通道数由2048缩减为d_model，(bs,d_model,h,w)
+        gallery_feat = self.input_proj(gallery_feat)  # 通道数由2048缩减为d_model，(bs,d_model,h,w)
+        gallery_feat = gallery_feat + pos  # (bs,d_model,h,w)
+        gallery_feat = gallery_feat.reshape(bs, d_model, -1).permute(2, 0, 1)  # (hw,bs,d_model)
+        transformer_output = self.transformer(query_feat_with_pos, gallery_feat)  # (hw,bs,d_model)
 
-        dec_in = self.query_embed.weight  # (max_len,d_model)，d_model为256，为embedding的权重，即object queries
+        point_scores = self.score_embed(transformer_output).sigmoid().squeeze(dim=-1)  # (hw,bs)
+        point_scores = point_scores.permute(1, 0).reshape(bs, feat_h, feat_w)  # (bs,feat_h,feat_w)
 
-        assert mask is not None
-        hs, reference = self.transformer(src, mask, dec_in, pos, args=args)
-        # hs(n_layer,bs,n_q,d_model), reference(bs,n_q,2)
-        src_2 = hs[-1].permute(1, 0, 2)  # (n_q,bs,d_model)
-        query_feat = query_person + pos_query
-        hs_2 = self.transformer_2(query_feat, src_2)  # (n_q,bs,d_model)
-
-        n_layer = hs.shape[0]
-        hs_box = hs
-        hs_score = hs
-
-        reference_before_sigmoid = inverse_sigmoid(reference)  # 将sigmoid后的值变回去
-        outputs_coord = self.bbox_embed(hs_box)  # (n_layer,bs,n_q,4)
-        reference_before_sigmoid = reference_before_sigmoid.unsqueeze(dim=0).repeat(n_layer, 1, 1, 1)
-        outputs_coord[..., :2] += reference_before_sigmoid  # 给中心点加上初始量（即reference point）
-        outputs_coord = outputs_coord.sigmoid()  # 框值缩放到0~1区间, (n_layer,bs,n_q,4)
-
-        outputs_class = self.class_embed(hs_score)  # (n_layer,bs,n_q,2)
-
-        mt = outputs_class[-1]
-        tgt_logits = self.tgt_score_proj(hs_2).permute(1, 0, 2)  # (bs,n_q,2)
-        tgt_logits = torch.cat([mt, tgt_logits], dim=-1)  # (bs,n_q,4)
-        tgt_logits = self.tgt_logits_proj(tgt_logits)  # (bs,n_q,2)
+        pred_boxes = self.bbox_embed(transformer_output).sigmoid()  # (hw,bs,4)
+        pred_boxes = pred_boxes.permute(1, 0, 2).reshape(bs, feat_h, feat_w, 4)  # (bs,feat_h,feat_w,4)
 
         out = {
-            'pred_logits': outputs_class[-1],  # (bs,n_q,2)
-            'pred_boxes': outputs_coord[-1],  # (bs,n_q,4)
-            'tgt_logits': tgt_logits,  # (bs,n_q,2)
+            'point_scores': point_scores,  # (bs,feat_h,feat_w)
+            'pred_boxes': pred_boxes,  # (bs,feat_h,feat_w,4)
         }  # 只取最后一层decoder的结果
-        if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)  # 除最后一个decoder layer的前几个层输出
 
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
+    def _set_aux_loss(self, outputs_coord):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b}
-                for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+        return [{'pred_points': a}
+                for a in outputs_coord[:-1]]
 
     @torch.jit.unused
     def _set_aux_loss_for_cos(self, outputs_coord, cos_sim):
@@ -200,6 +183,67 @@ class ConditionalDETR(nn.Module):
         return [{'pred_logits': a, 'pred_boxes': b, 'cos_sim': c}
                 for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], cos_sim[:-1])]
 
+def sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float = 2, use_bce: bool = False):
+    """
+    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+        alpha: (optional) Weighting factor in range (0,1) to balance
+                positive vs negative examples. Default = -1 (no weighting).
+        gamma: Exponent of the modulating factor (1 - p_t) to
+               balance easy vs hard examples.
+    Returns:
+        Loss tensor
+    """
+    if use_bce:
+        prob = inputs
+        ce_loss = F.binary_cross_entropy(inputs, targets, reduction="none")
+    else:
+        prob = inputs.sigmoid()
+        ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    p_t = prob * targets + (1 - prob) * (1 - targets)
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
+
+    return loss
+
+
+def feature_map_to_image_coordinates(hw, original_image_shape):
+    """
+    将特征图上的每个点映射到原图像上的坐标。
+
+    参数:
+    hw (tuple): 特征图的高度和宽度 (h, w)。
+    original_image_shape (tuple): 原图像的形状 (height, width)。
+
+    返回:
+    torch.Tensor: 一个形状为 (h, w, 2) 的 PyTorch Tensor，
+    包含特征图上每个点在原图像上的坐标。
+    """
+    h, w = hw
+    original_image_height, original_image_width = original_image_shape
+
+    y_ratio = original_image_height / h
+    x_ratio = original_image_width / w
+
+    # 创建坐标网格
+    y_grid, x_grid = torch.meshgrid(torch.arange(h), torch.arange(w))
+    y_grid = y_grid.to(torch.float32)
+    x_grid = x_grid.to(torch.float32)
+
+    # 计算特征图上每个点在原图像上的坐标
+    image_coordinates = torch.zeros((h, w, 2), dtype=torch.float32)
+    image_coordinates[..., 1] = y_grid * y_ratio
+    image_coordinates[..., 0] = x_grid * x_ratio
+
+    return image_coordinates
 
 class SetCriterion(nn.Module):
     """ This class computes the loss for Conditional DETR.
@@ -225,57 +269,6 @@ class SetCriterion(nn.Module):
         self.focal_alpha = focal_alpha
         self.args = args
 
-    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
-        """Classification loss (Binary focal loss)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
-        """
-        assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits']  # (bs,n_q,2)
-
-        idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                    dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o  # (bs,n_q)
-
-        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
-                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
-        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
-
-        target_classes_onehot = target_classes_onehot[:, :, :-1]
-        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * \
-                  src_logits.shape[1]
-        losses = {'loss_ce': loss_ce}
-
-        if log:
-            # TODO this should probably be a separate loss, not hacked in this one here
-            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
-        return losses
-
-    def loss_tgt(self, outputs, targets, indices, num_boxes, log=True):
-        """Classification loss (Binary focal loss)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
-        """
-        assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits']  # (bs,n_q,2)
-
-        idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                    dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o  # (bs,n_q)
-
-        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
-                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
-        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
-
-        target_classes_onehot = target_classes_onehot[:, :, :-1]
-        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * \
-                  src_logits.shape[1]
-        losses = {'loss_tgt': loss_ce}
-
-        return losses
-
     @torch.no_grad()
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
         """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
@@ -291,93 +284,74 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
-        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
-           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
-           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
-           notice that the boxes must in (xc, yc, w, h) format and normalized form [0, 1]
-        """
-        assert 'pred_boxes' in outputs
-        idx = self._get_src_permutation_idx(indices)
-        src_boxes = outputs['pred_boxes'][idx]
-        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        device = outputs['point_scores'].device
+        pred_scores = outputs['point_scores']  # (bs,feat_h,feat_w)
+        pred_boxes = outputs['pred_boxes']  # (bs,feat_h,feat_w,4)
+        assert (pred_boxes >= 0).all() and (pred_boxes <= 1).all()
+        tmp = torch.ones_like(pred_boxes, device=device)
+        tmp[..., :2] = -1
+        pred_boxes = pred_boxes * tmp  # (bs,feat_h,feat_w,4), (-x,-y,+x,+y)
+        feat_h, feat_w = outputs['point_scores'].shape[-2:]
+        bs = pred_scores.shape[0]
 
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        target_boxes_nml_s_list = [t['target_boxes_one_nml_s'] for t in targets]
+        tgt_boxes_s = torch.cat(target_boxes_nml_s_list, dim=0).to(device)  # (bs,4), (xmin,ymin,xmax,ymax)
+        assert (tgt_boxes_s[:, 2:] - tgt_boxes_s[:, :2] > 0).all()
+        tgt_boxes_s_feat = tgt_boxes_s * torch.tensor([feat_w, feat_h, feat_w, feat_h], device=device).reshape(1, 4)  # (bs,4)
+        mask = torch.zeros_like(pred_scores, device=device)  # (bs,feat_h,feat_w)
+        ref_points = feature_map_to_image_coordinates((feat_h, feat_w), (1, 1)).to(device)  # (feat_h,feat_w,2), (x,y)
+        for i in range(bs):
+            index = tgt_boxes_s_feat[i].long()  # (4,)  # (xmin,ymin,xmax,ymax)
+            index[-2:] += 1
+            assert index[0] < index[2] and index[1] < index[3]
+            mask[i, index[1]:index[3], index[0]:index[2]] = 1
+            pred_boxes[i] = pred_boxes[i] + ref_points.repeat(1, 1, 2)  # (feat_h,feat_w,4), (xmin,ymin,xmax,ymax)
+        tgt_boxes = tgt_boxes_s.unsqueeze(dim=1).repeat(1, feat_h * feat_w, 1).reshape(bs, feat_h, feat_w, 4)  # (bs,feat_h,feat_w,4)
+        loss_l1 = F.smooth_l1_loss(pred_boxes, tgt_boxes, reduction='none')  # (bs,feat_h, feat_w,4)
+        loss_l1 *= mask.unsqueeze(dim=-1).repeat(1, 1, 1, 4)  # (bs,feat_h,feat_w,4)
+        mask_num = mask.sum()
+        loss_l1 = loss_l1.sum() / mask_num
 
-        losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+        mask_index_true = mask == 1
+        pred_boxes_true = pred_boxes[mask_index_true]
+        tgt_boxes_true = tgt_boxes[mask_index_true]
+        loss_giou = 1 - box_ops.generalized_box_iou(pred_boxes_true, tgt_boxes_true)  # (n,n)
+        loss_giou = torch.diag(loss_giou).sum() / mask_num
 
-        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-            box_ops.box_cxcywh_to_xyxy(src_boxes),
-            box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        loss = loss_l1 + loss_giou
+
+        losses = {'loss_boxes': loss}
         return losses
 
-    def loss_masks(self, outputs, targets, indices, num_boxes):
-        """Compute the losses related to the masks: the focal loss and the dice loss.
-           targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
-        """
-        assert "pred_masks" in outputs
 
-        src_idx = self._get_src_permutation_idx(indices)
-        tgt_idx = self._get_tgt_permutation_idx(indices)
-        src_masks = outputs["pred_masks"]
-        src_masks = src_masks[src_idx]
-        masks = [t["masks"] for t in targets]
-        # TODO use valid to mask invalid areas due to padding in loss
-        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
-        target_masks = target_masks.to(src_masks)
-        target_masks = target_masks[tgt_idx]
-
-        # upsample predictions to the target size
-        src_masks = interpolate(src_masks[:, None], size=target_masks.shape[-2:],
-                                mode="bilinear", align_corners=False)
-        src_masks = src_masks[:, 0].flatten(1)
-
-        target_masks = target_masks.flatten(1)
-        target_masks = target_masks.view(src_masks.shape)
-        losses = {
-            "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes),
-            "loss_dice": dice_loss(src_masks, target_masks, num_boxes),
-        }
+    def loss_points(self, outputs, targets, indices, num_boxes):
+        device = outputs['point_scores'].device
+        pred_scores = outputs['point_scores']  # (bs,feat_h,feat_w)
+        feat_h, feat_w = outputs['point_scores'].shape[-2:]
+        bs = pred_scores.shape[0]
+        target_boxes_nml_s_list = [t['target_boxes_one_nml_s'] for t in targets]
+        tgt_boxes_s = torch.cat(target_boxes_nml_s_list, dim=0).to(device)  # (bs,4
+        tgt_boxes_s = tgt_boxes_s * torch.tensor([feat_w, feat_h, feat_w, feat_h], device=device).reshape(1, 4)  # (bs,4)
+        tgt_scores = torch.zeros_like(pred_scores, device=device)  # (bs,feat_h,feat_w)
+        for i in range(bs):
+            index = tgt_boxes_s[i].long()  # (4,)  # (xmin,ymin,xmax,ymax)
+            index[-2:] += 1
+            tgt_scores[i, index[1]:index[3], index[0]:index[2]] = 1
+        #loss_points = sigmoid_focal_loss(pred_scores, tgt_scores, use_bce=True)  # (bs,feat_h,feat_w)
+        loss_points = F.binary_cross_entropy(pred_scores, tgt_scores, reduction='none')  # (bs,feat_h,feat_w)
+        loss_points = loss_points.sum() / (bs * feat_h * feat_w)
+        losses = {'loss_points': loss_points}
         return losses
 
-    def _get_src_permutation_idx(self, indices):
-        # permute predictions following indices
-        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
 
-    def _get_tgt_permutation_idx(self, indices):
-        # permute targets following indices
-        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
-        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
-        return batch_idx, tgt_idx
-
-    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+    def get_loss(self, loss, outputs, targets, indices=None, num_boxes=None, **kwargs):
         loss_map = {
-            'labels': self.loss_labels,
+            'points': self.loss_points,
             'boxes': self.loss_boxes,
-            'tgt': self.loss_tgt,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
-    def get_loss_for_cos(self, loss, outputs, targets, indices, num_boxes, **kwargs):
-        loss_map = {
-            'labels': self.loss_labels_for_cos,
-            'boxes': self.loss_boxes,
-            'tgt': self.loss_tgt,
-        }
-        assert loss in loss_map, f'do you really want to compute {loss} loss?'
-        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
-
-    def matcher_top(self,outputs):
-        scores = outputs["pred_logits"][:,:,-1]
-        tensor0 = torch.tensor([0])
-        device = tensor0.device
-        max_index = torch.argmax(scores,dim=1)
-        re = [(index.reshape(1).to(device), tensor0) for index in max_index]
-        return re
 
     def box_cos_rlt(self, losses):
         # 对loss_ce进行动态权重调整
@@ -397,68 +371,24 @@ class SetCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
-        device = outputs['pred_logits'].device
-
-        outputs_for_tgt = {}
-        targets_for_tgt = []
-        for t in targets:
-            tmp = {}
-            tmp['labels'] = t['target_labels'].to(device)
-            tmp['boxes'] = box_decoder(t['target_boxes_nml'],device)  # 转为(xc,yc,w,h)
-            assert tmp['labels'].shape[0] == tmp['boxes'].shape[0]
-            targets_for_tgt.append(tmp)
-        targets_for_tgt = tuple(targets_for_tgt)
-        assert outputs['pred_logits'].shape == outputs['tgt_logits'].shape
-        outputs_for_tgt['pred_boxes'] = outputs['pred_boxes']
-        outputs_for_tgt['pred_logits'] = outputs['tgt_logits']
-        indices_tgt = self.matcher(outputs_for_tgt, targets_for_tgt)
-
-        outputs_for_people = {}
-        targets_for_people = []
-        for t in targets:
-            tmp = {}
-            tmp['labels'] = t['labels_all_one'].to(device)
-            tmp['boxes'] = box_decoder(t['boxes_nml'],device)
-            assert tmp['labels'].shape[0] == tmp['boxes'].shape[0]
-            targets_for_people.append(tmp)
-        targets_for_people = tuple(targets_for_people)
-        outputs_for_people['pred_boxes'] = outputs['pred_boxes']
-        outputs_for_people['pred_logits'] = outputs['pred_logits']
-        indices = self.matcher(outputs_for_people, targets_for_people)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
-        num_boxes = sum(len(t["labels"]) for t in targets_for_people)
+        num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
 
-        num_boxes_tgt = sum(len(t["labels"]) for t in targets_for_tgt)
-        num_boxes_tgt = torch.as_tensor([num_boxes_tgt], dtype=torch.float, device=next(iter(outputs.values())).device)
-        if is_dist_avail_and_initialized():
-            torch.distributed.all_reduce(num_boxes_tgt)
-        num_boxes_tgt = torch.clamp(num_boxes_tgt / get_world_size(), min=1).item()
-
         # Compute all the requested losses
         losses = {}
 
-        losses.update(self.get_loss('tgt', outputs_for_tgt, targets_for_tgt, indices_tgt, num_boxes_tgt))
-
         for loss in self.losses:
-            if loss == 'masks' or loss == 'cardinality' or loss == 'tgt':
-                continue
-            losses.update(self.get_loss(loss, outputs_for_people, targets_for_people, indices, num_boxes))
+            losses.update(self.get_loss(loss, outputs, targets, num_boxes))
+
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                indices = self.matcher(aux_outputs, targets_for_people)
                 for loss in self.losses:
-                    if loss == 'masks' or loss == 'cardinality' or loss == 'tgt':
-                        continue
-                    kwargs = {}
-                    if loss == 'labels':
-                        # Logging is enabled only for the last layer
-                        kwargs = {'log': False}
-                    l_dict = self.get_loss(loss, aux_outputs, targets_for_people, indices, num_boxes, **kwargs)
+                    l_dict = self.get_loss(loss, aux_outputs, targets, num_boxes=num_boxes)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
@@ -530,7 +460,7 @@ def build(args):
 
     backbone = build_backbone(args)
 
-    transformer = build_transformer(args)
+    transformer = build_transformer(args,query_feat_add=True)
 
     model = ConditionalDETR(
         backbone,
@@ -542,13 +472,10 @@ def build(args):
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
     matcher = build_matcher(args)
-    weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
+    weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_boxes': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
-    weight_dict['loss_tgt'] = args.tgt_loss_coef
+    weight_dict['loss_points'] = args.pts_loss_coef
 
-    if args.masks:
-        weight_dict["loss_mask"] = args.mask_loss_coef
-        weight_dict["loss_dice"] = args.dice_loss_coef
     # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
@@ -556,47 +483,11 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'cardinality', 'tgt']
-    if args.masks:
-        losses += ["masks"]
+    losses = ['points', 'boxes']
+
     criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
                              focal_alpha=args.focal_alpha, losses=losses, args=args)
     criterion.to(device)
     postprocessors = {'bbox': PostProcess()}
-    if args.masks:
-        postprocessors['segm'] = PostProcessSegm()
-        if args.dataset_file == "coco_panoptic":
-            is_thing_map = {i: i <= 90 for i in range(201)}
-            postprocessors["panoptic"] = PostProcessPanoptic(is_thing_map, threshold=0.85)
 
     return model, criterion, postprocessors
-
-# if args.mode == 'cos':
-#     if args.test_reid:
-#         target_boxes_tensor = torch.stack(target_boxes_list, dim=0)  # (bs,4)
-#         target_boxes_tensor = box_decoder(target_boxes_tensor, device)  # (bs,4)
-#         outputs_coord[0,:,0,:] = target_boxes_tensor  # 将第一层的第一个预测框替换为gt框
-#     # 余弦相似度
-#     image_sizes_gallery_single = torch.tensor(image_sizes_gallery[0])  # tensor (2,)
-#     outputs_coord_bs = outputs_coord.permute(1, 0, 2, 3).reshape(bs,n_layer*n_q,4)  # (bs,n_layer*n_q,4)
-#     boxes_list = [xywhn_to_xyxy(box, image_sizes_gallery_single) for box in outputs_coord_bs]  # bs大小的list，每个元素为tensor (n_layer*n_q,4)，为预测框映射回原图的坐标
-#     boxes_person = self.roi_pool(OrderedDict([["feat", src]]), boxes_list, image_sizes_gallery)  # (bs*n_layer*n_q,256,ql,ql)
-#     boxes_person = self.pool_to_11(boxes_person)  # (bs*n_layer*n_q,256,1,1)
-#     boxes_person = boxes_person.reshape(bs * n_layer, n_q, -1)  # (bs*n_layer,n_q,256)
-#
-#     #boxes_person = hs.permute(1, 0, 2, 3).reshape(bs*n_layer, n_q, -1)  # (bs*n_layer,n_q,256)
-#
-#     query_person_reid_feat = query_person_reid_feat / torch.norm(query_person_reid_feat, dim=2, keepdim=True)  # (bs,1,256)
-#     boxes_person = boxes_person / torch.norm(boxes_person, dim=2, keepdim=True)  # (bs*n_layer,n_q,256)
-#     query_person_reid_feat = query_person_reid_feat.unsqueeze(dim=1).repeat(1, n_layer, 1, 1).reshape(n_layer * bs, 1, -1)  # (bs*n_layer,1,256)
-#     boxes_with_query = torch.cat([query_person_reid_feat, boxes_person], dim=1)  # (bs*n_layer,n_q+1,256), 第0个为query
-#     cos_sim = torch.matmul(boxes_with_query, boxes_with_query.transpose(1, 2))  # (bs*n_layer,n_q+1,n_q+1), 值域为[-1,1]
-#
-#     cos_sim_query = cos_sim.reshape(bs, n_layer, n_q + 1, n_q + 1).permute(1, 0, 2, 3)[:,:,0,1:].unsqueeze(dim=-1)  # (n_layer,bs,n_q,1)
-#     out = {
-#         'pred_boxes': outputs_coord[-1],  # (bs,n_q,4)
-#         'pred_logits': cos_sim_query[-1]  # (bs,n_q,1)
-#     }  # 只取最后一层decoder的结果
-#     if self.aux_loss:
-#         out['aux_outputs'] = self._set_aux_loss_for_cos(outputs_coord, cos_sim_query)  # 除最后一个decoder layer的前几个层输出
-#     return out

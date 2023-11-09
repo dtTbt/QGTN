@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw
 import shutil
 
 from torchvision.ops import boxes as box_ops
+from util.misc import feature_map_to_image_coordinates
 
 
 def draw_boxes(image_path, boxes, output_folder, xyxy, sfx, keep_name, scores=None, is_cos_sim=False):
@@ -168,36 +169,6 @@ def box_encoder(box, device):  # (xc,yc,w,h) -> (x,y,x,y)
     boxes[:, 2:] = boxes_t[:, :2] + boxes_t[:, 2:] / 2
     return boxes
 
-def feature_map_to_image_coordinates(hw, original_image_shape):
-    """
-    将特征图上的每个点映射到原图像上的坐标。
-
-    参数:
-    hw (tuple): 特征图的高度和宽度 (h, w)。
-    original_image_shape (tuple): 原图像的形状 (height, width)。
-
-    返回:
-    torch.Tensor: 一个形状为 (h, w, 2) 的 PyTorch Tensor，
-    包含特征图上每个点在原图像上的坐标。
-    """
-    h, w = hw
-    original_image_height, original_image_width = original_image_shape
-
-    y_ratio = original_image_height / h
-    x_ratio = original_image_width / w
-
-    # 创建坐标网格
-    y_grid, x_grid = torch.meshgrid(torch.arange(h), torch.arange(w))
-    y_grid = y_grid.to(torch.float32)
-    x_grid = x_grid.to(torch.float32)
-
-    # 计算特征图上每个点在原图像上的坐标
-    image_coordinates = torch.zeros((h, w, 2), dtype=torch.float32)
-    image_coordinates[..., 1] = y_grid * y_ratio
-    image_coordinates[..., 0] = x_grid * x_ratio
-
-    return image_coordinates
-
 
 def post_process(outputs, targets):
     pred_scores = outputs['point_scores']  # (bs,h_feat,w_feat)
@@ -219,14 +190,13 @@ def post_process(outputs, targets):
         # 获得最大的那个点
         index = torch.argmax(scores_bs)
         index = (index // w_feat, index % w_feat)
-        boxes_bs = boxes_bs[index]  # (n,4), n为置信度大于0.5的点的个数
-        scores_max_bs = scores_bs[index]  # (n,)
+        boxes_bs = boxes_bs[index]  # (4,)
+        scores_max_bs = scores_bs[index]  # ()
 
         img_ori_shape = targets[i]['img'].shape[1:]  # (h,w)
         img_same_shape = targets[i]['img_same_shape'].shape[1:]  # (h,w)
 
-        boxes_bs_before_nml = boxes_bs * torch.tensor(img_same_shape).flip(dims=[0]).repeat(2).reshape(1, 4).to(device)
-        boxes_bs = boxes_bs_before_nml / torch.tensor(img_ori_shape).flip(dims=[0]).repeat(2).reshape(1, 4).to(device)
+        #boxes_bs = boxes_bs * torch.tensor(img_ori_shape).flip(dims=[0]).repeat(2).to(device)  # (4,), (xmin,ymin,xmax,ymax)
 
         boxes_out.append(boxes_bs)
         scores_out.append(scores_max_bs)
@@ -238,8 +208,8 @@ def post_process(outputs, targets):
         points_score.append(scores_bs)
 
     out_dic = {
-        'boxes_out': boxes_out,  # list，bs个元素，每个元素为(n,4)，n为每张图片检测出的行人数
-        'scores_out': scores_out,  # list，bs个元素，每个元素为(n,)
+        'boxes_out': boxes_out,  # list，bs个元素，每个元素为(4,)，n为每张图片检测出的行人数
+        'scores_out': scores_out,  # list，bs个元素，每个元素为()，为每张图片置信度最高框的置信度
         'points_at_img': points_at_img,  # list，bs个元素，每个元素为(feat_h,feat_w,2)，(x,y)
         'points_score': points_score,  # list，bs个元素，每个元素为(feat_h,feat_w)
     }
@@ -252,7 +222,6 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
     header = ''
     print_freq = 10
     model.eval()
-    cache_path = './eval_cache.pth'
     output_folder = './look'
     if os.path.exists(output_folder):
         shutil.rmtree(output_folder)
@@ -283,39 +252,29 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
 
             outputs = model(query_nes, gallery_nes, query_boxes_list, image_sizes, image_sizes_gallery, auto_amp=False, args=args)
             out_dic = post_process(outputs, gallery)
-            boxes_out = out_dic['boxes_out']  # (bs,4)
-            scores_out = out_dic['scores_out']  # (bs,)
-            points_at_img = out_dic['points_at_img']  # (bs,feat_h,feat_w,2)
-            points_score = out_dic['points_score']  # (bs,feat_h,feat_w)
+            boxes_out = out_dic['boxes_out']  # list，bs个元素，每个元素为(4,)，(xmin,ymin,xmax,ymax)
+            scores_out = out_dic['scores_out']  # list，bs个元素，每个元素为()，为每张图片置信度最高框的置信度
+            points_at_img = out_dic['points_at_img']  # list，bs个元素，每个元素为(feat_h,feat_w,2)，(x,y)
+            points_score = out_dic['points_score']  # list，bs个元素，每个元素为(feat_h,feat_w)
 
             for index, ps in enumerate(query):
                 pid = int(ps['pids'])
 
                 #这里暂时只考虑一张图片只出现一次query人的情况, 因此boxes_bs_num直接设定为1
                 boxes_bs_num = 1
-                boxes_bs_xyxy = boxes_out[index]
+                boxes_bs_xyxy = boxes_out[index].unsqueeze(0)  # (1,4)
                 target_boxes_bs = gallery[index]['target_boxes_one_nml'].to(device)
 
                 query_num_all += boxes_bs_num
                 ious = box_iou(boxes_bs_xyxy, target_boxes_bs)
-                flg = 0
                 for i in range(boxes_bs_num):
                     if ious[i] > 0.5:
                         query_num_right += 1
-                        flg = 1
-                    else:
-                        # 若中心点距离小于0.1，也算正确
-                        center_dis = torch.sqrt(torch.sum((boxes_bs_xyxy[i, :2] - target_boxes_bs[i, :2]) ** 2))
-                        if center_dis < 0.1:
-                            query_num_right += 1
-                            flg = 2
 
                 if save:
-                    pred_boxes_bs = boxes_out[index]
                     pred_scores_bs = scores_out[index]
-                    draw_boxes(gallery[index]['img_path'], pred_boxes_bs, output_folder, xyxy=True, sfx=str(pid) + '-' + str(index) + '-pred-' + str(flg), keep_name=False, scores=pred_scores_bs)
+                    draw_boxes(gallery[index]['img_path'], boxes_bs_xyxy, output_folder, xyxy=True, sfx=str(pid) + '-' + str(index) + '-pred-', keep_name=False, scores=pred_scores_bs)
                     # 画出target
-                    target_boxes_bs = gallery[index]['target_boxes_nml']
                     draw_boxes(gallery[index]['img_path'], target_boxes_bs, output_folder, xyxy=True, sfx=str(pid) + '-' + str(index) + '-target', keep_name=False)
                     # 画出query
                     query_boxes_bs = query[index]['boxes_nml']
@@ -329,3 +288,4 @@ def eval(model, data_loader,device,enable_amp, scaler, use_cache=False, save=Fal
 
         find_query_acc = query_num_right / query_num_all
         print(f'find_query_acc: {find_query_acc * 100:.2f}%')
+        return find_query_acc * 100

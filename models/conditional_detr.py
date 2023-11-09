@@ -33,6 +33,8 @@ from collections import OrderedDict
 from torchvision.ops import MultiScaleRoIAlign
 from torchvision.ops import box_iou
 
+from util.misc import feature_map_to_image_coordinates
+
 
 def box_encoder(box, device=None):  # (xc,yc,w,h) -> (x,y,x,y)
     if device == None:
@@ -78,7 +80,7 @@ class ConditionalDETR(nn.Module):
             d_model=hidden_dim,
             nhead=8,
             num_encoder_layers=1,
-            num_decoder_layers=6,
+            num_decoder_layers=3,
             dim_feedforward=2048,
         )
 
@@ -142,7 +144,7 @@ class ConditionalDETR(nn.Module):
         point_scores = self.score_embed(transformer_output).sigmoid().squeeze(dim=-1)  # (hw,bs)
         point_scores = point_scores.permute(1, 0).reshape(bs, feat_h, feat_w)  # (bs,feat_h,feat_w)
 
-        pred_boxes = self.bbox_embed(transformer_output).sigmoid()  # (hw,bs,4)
+        pred_boxes = self.bbox_embed(gallery_feat).sigmoid()  # (hw,bs,4)
         pred_boxes = pred_boxes.permute(1, 0, 2).reshape(bs, feat_h, feat_w, 4)  # (bs,feat_h,feat_w,4)
 
         out = {
@@ -215,36 +217,6 @@ def sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float = 2, u
     return loss
 
 
-def feature_map_to_image_coordinates(hw, original_image_shape):
-    """
-    将特征图上的每个点映射到原图像上的坐标。
-
-    参数:
-    hw (tuple): 特征图的高度和宽度 (h, w)。
-    original_image_shape (tuple): 原图像的形状 (height, width)。
-
-    返回:
-    torch.Tensor: 一个形状为 (h, w, 2) 的 PyTorch Tensor，
-    包含特征图上每个点在原图像上的坐标。
-    """
-    h, w = hw
-    original_image_height, original_image_width = original_image_shape
-
-    y_ratio = original_image_height / h
-    x_ratio = original_image_width / w
-
-    # 创建坐标网格
-    y_grid, x_grid = torch.meshgrid(torch.arange(h), torch.arange(w))
-    y_grid = y_grid.to(torch.float32)
-    x_grid = x_grid.to(torch.float32)
-
-    # 计算特征图上每个点在原图像上的坐标
-    image_coordinates = torch.zeros((h, w, 2), dtype=torch.float32)
-    image_coordinates[..., 1] = y_grid * y_ratio
-    image_coordinates[..., 0] = x_grid * x_ratio
-
-    return image_coordinates
-
 class SetCriterion(nn.Module):
     """ This class computes the loss for Conditional DETR.
     The process happens in two steps:
@@ -294,8 +266,10 @@ class SetCriterion(nn.Module):
         feat_h, feat_w = outputs['point_scores'].shape[-2:]
         bs = pred_scores.shape[0]
 
-        target_boxes_nml_s_list = [t['target_boxes_one_nml_s'] for t in targets]
+        target_boxes_nml_s_list = [t['target_boxes_one_nml_s'] for t in targets]  # 以相对same尺寸归一化的框
+        target_boxes_nml_list = [t['target_boxes_one_nml'] for t in targets]  # 以相对原尺寸归一化的框
         tgt_boxes_s = torch.cat(target_boxes_nml_s_list, dim=0).to(device)  # (bs,4), (xmin,ymin,xmax,ymax)
+        tgt_boxes = torch.cat(target_boxes_nml_list, dim=0).to(device)  # (bs,4), (xmin,ymin,xmax,ymax)
         assert (tgt_boxes_s[:, 2:] - tgt_boxes_s[:, :2] > 0).all()
         tgt_boxes_s_feat = tgt_boxes_s * torch.tensor([feat_w, feat_h, feat_w, feat_h], device=device).reshape(1, 4)  # (bs,4)
         mask = torch.zeros_like(pred_scores, device=device)  # (bs,feat_h,feat_w)
@@ -306,7 +280,7 @@ class SetCriterion(nn.Module):
             assert index[0] < index[2] and index[1] < index[3]
             mask[i, index[1]:index[3], index[0]:index[2]] = 1
             pred_boxes[i] = pred_boxes[i] + ref_points.repeat(1, 1, 2)  # (feat_h,feat_w,4), (xmin,ymin,xmax,ymax)
-        tgt_boxes = tgt_boxes_s.unsqueeze(dim=1).repeat(1, feat_h * feat_w, 1).reshape(bs, feat_h, feat_w, 4)  # (bs,feat_h,feat_w,4)
+        tgt_boxes = tgt_boxes.unsqueeze(dim=1).repeat(1, feat_h * feat_w, 1).reshape(bs, feat_h, feat_w, 4)  # (bs,feat_h,feat_w,4)
         loss_l1 = F.smooth_l1_loss(pred_boxes, tgt_boxes, reduction='none')  # (bs,feat_h, feat_w,4)
         loss_l1 *= mask.unsqueeze(dim=-1).repeat(1, 1, 1, 4)  # (bs,feat_h,feat_w,4)
         mask_num = mask.sum()
@@ -378,6 +352,7 @@ class SetCriterion(nn.Module):
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+        num_boxes = 1.
 
         # Compute all the requested losses
         losses = {}

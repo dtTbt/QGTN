@@ -43,8 +43,7 @@ def get_args_parser():
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--lr_drop', default=15, type=int)
-    parser.add_argument('--clip_max_norm', default=0.1, type=float,
-                        help='gradient clipping max norm')
+    parser.add_argument('--clip_max_norm', default=0.1, type=float, help='gradient clipping max norm')
     parser.add_argument('--num_class', default=2, type=int)
 
     # Model parameters
@@ -130,11 +129,12 @@ def get_args_parser():
     parser.add_argument('--data_enhance_num', default=3, type=int, help='data enhancement number')
 
     # Others
+    parser.add_argument('--dataset_path', default='/root/autodl-fs/CUHK-SYSU', type=str)  # /root/autodl-fs/CUHK-SYSU
     parser.add_argument('--ctn', default='', type=str)
-    parser.add_argument('--eval_pth', default='/QGTN/model_epoch2.pth', type=str)
+    parser.add_argument('--eval_pth', default='', type=str)
     parser.add_argument('--model_save_dir', default='./train_pth', type=str)
     parser.add_argument('--show_no_grad', default=False, type=bool)
-    parser.add_argument('--train_show', default=True, type=bool)
+    parser.add_argument('--train_show', default=False, type=bool)
 
     return parser
 
@@ -181,9 +181,10 @@ def main(args):
 
     #dataset_train = build_dataset('CUHK-SYSU', '/CUHK-SYSU', make_coco_transforms('train'), "train", )
 
-    dataset_train_full = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=True), "train_full", args=args)
-    dataset_val = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "val", args=args)
-    dataset_tv = build_dataset('CUHK-SYSU', '/CUHK-SYSU', build_transforms(is_train=False), "train_val", args=args)
+    dataset_path = args.dataset_path
+    dataset_train_full = build_dataset('CUHK-SYSU', dataset_path, build_transforms(is_train=True), "train_full", args=args)
+    dataset_val = build_dataset('CUHK-SYSU', dataset_path, build_transforms(is_train=False), "val", args=args)
+    dataset_tv = build_dataset('CUHK-SYSU', dataset_path, build_transforms(is_train=False), "train_val", args=args)
 
     if args.distributed:
         sampler_train_full = DistributedSampler(dataset_train_full)
@@ -246,18 +247,18 @@ def main(args):
         if utils.is_main_process():
             save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}.pth')
             torch.save(model_without_ddp.state_dict(), save_path)
+            print(f"Save model at {save_path}")
 
-        # if (epoch + 1) % 3 == 0:
-        #     acc_t = eval_cuhk.eval(model, data_loader_tv, device, enable_amp, scaler, use_cache=False, save=False, args=args)
-        #     acc_t = round(acc_t, 2)
-        #
-        #     acc = eval_cuhk.eval(model, data_loader_val, device, enable_amp, scaler, use_cache=False, save=False, args=args)
-        #     acc = round(acc, 2)
-        #
-        #     if utils.is_main_process():
-        #         save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}_val{acc}_tv{acc_t}.pth')
-        #         torch.save(model_without_ddp.state_dict(), save_path)
-        #         print(f'Model saved at epoch {epoch}.')
+        if (epoch + 1) % 3 == 0:
+            acc_t = eval_cuhk.eval(model, data_loader_tv, device, enable_amp, scaler, use_cache=False, save=True, args=args)
+            acc_t = round(acc_t, 2)
+
+            acc = eval_cuhk.eval(model, data_loader_val, device, enable_amp, scaler, use_cache=False, save=True, args=args)
+            acc = round(acc, 2)
+
+            if utils.is_main_process():
+                save_path = os.path.join(args.model_save_dir, f'model_epoch{epoch}_val{acc}_tv{acc_t}.pth')
+                torch.save(model_without_ddp.state_dict(), save_path)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

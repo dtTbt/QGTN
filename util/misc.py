@@ -32,6 +32,37 @@ if float(torchvision.__version__.split(".")[1]) < 7.0:
     from torchvision.ops.misc import _output_size
 
 
+def feature_map_to_image_coordinates(hw, original_image_shape):
+    """
+    将特征图上的每个点映射到原图像上的坐标。
+
+    参数:
+    hw (tuple): 特征图的高度和宽度 (h, w)。
+    original_image_shape (tuple): 原图像的形状 (height, width)。
+
+    返回:
+    torch.Tensor: 一个形状为 (h, w, 2) 的 PyTorch Tensor，
+    包含特征图上每个点在原图像上的坐标。
+    """
+    h, w = hw
+    original_image_height, original_image_width = original_image_shape
+
+    y_ratio = original_image_height / h
+    x_ratio = original_image_width / w
+
+    # 创建坐标网格
+    y_grid, x_grid = torch.meshgrid(torch.arange(h), torch.arange(w))
+    y_grid = y_grid.to(torch.float32)
+    x_grid = x_grid.to(torch.float32)
+
+    # 计算特征图上每个点在原图像上的坐标
+    image_coordinates = torch.zeros((h, w, 2), dtype=torch.float32)
+    image_coordinates[..., 1] = y_grid * y_ratio + y_ratio / 2
+    image_coordinates[..., 0] = x_grid * x_ratio + x_ratio / 2
+
+    return image_coordinates
+
+
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
     window or the global series average.
